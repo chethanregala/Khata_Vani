@@ -1,11 +1,298 @@
 require('dotenv').config();
 const express = require('express');
+const cookieParser = require('cookie-parser');
+const { rateLimit, ipKeyGenerator } = require('express-rate-limit');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+const { createClient } = require('@supabase/supabase-js');
+
 const app = express();
 const B = 'https://api.vachana.ai', K = process.env.GNANI_API_KEY;
 const E = process.env;
-app.use(express.static('public'));
+const PORT = E.PORT || 3000;
+const PROD = E.NODE_ENV === 'production';
+const JWT_SECRET = E.JWT_SECRET;
 
-app.post('/api/stt', express.raw({ type: () => true, limit: '5mb' }), async (req, res) => {
+// ---- config checks (never print secret values) ----
+if (!JWT_SECRET) { console.error('FATAL: JWT_SECRET is missing in .env'); process.exit(1); }
+
+// Supabase — server-side only. URL/key are never sent to the browser or logged.
+// Accepts SUPABASE_SERVICE_KEY or SUPABASE_SECRET_KEY (Supabase's newer name).
+const SUPABASE_URL = E.SUPABASE_URL;
+const SUPABASE_KEY = E.SUPABASE_SERVICE_KEY || E.SUPABASE_SECRET_KEY;
+const sb = (SUPABASE_URL && SUPABASE_KEY)
+  ? createClient(SUPABASE_URL, SUPABASE_KEY, { auth: { persistSession: false, autoRefreshToken: false } })
+  : null;
+const db = () => {
+  if (!sb) { const e = new Error('supabase not configured'); e.code = 'NO_SUPA'; throw e; }
+  return sb;
+};
+// shared error responder: Telugu message to the caller, details only to server log
+function fail(res, e, ctx) {
+  if (e && e.code === 'NO_SUPA') return res.status(503).json({ error: 'డేటాబేస్ అమరిక లేదు, యజమానిని సంప్రదించండి' });
+  console.error(ctx, e && (e.code || e.message));
+  return res.status(500).json({ error: 'సర్వర్ సమస్య, మళ్లీ ప్రయత్నించండి' });
+}
+
+// TTS word cache: data/tts-cache/<sha1(word)>.wav — each word is synthesized once.
+const CACHE_DIR = path.join(__dirname, 'data', 'tts-cache');
+fs.mkdirSync(CACHE_DIR, { recursive: true });
+
+app.use(express.static('public'));
+app.use(express.json());
+app.use(cookieParser(JWT_SECRET));
+
+// ---- small validators ----
+const validPhone = p => /^[6-9]\d{9}$/.test(String(p == null ? '' : p).trim());
+const validPin = p => /^\d{4}$/.test(String(p == null ? '' : p).trim());
+
+// ---- session cookie (JWT, 30 days, httpOnly + signed + sameSite=lax) ----
+function setSession(res, shop) {
+  const token = jwt.sign({ shopId: shop.id, phone: shop.phone }, JWT_SECRET, { expiresIn: '30d' });
+  res.cookie('session', token, {
+    httpOnly: true, sameSite: 'lax', signed: true,
+    secure: PROD, maxAge: 30 * 24 * 60 * 60 * 1000,
+  });
+}
+function clearSession(res) {
+  res.clearCookie('session', { httpOnly: true, sameSite: 'lax', signed: true, secure: PROD, path: '/' });
+}
+// voiceOk token: proves the challenge word was heard; 5 minutes, bound to phone
+function voiceOkPhone(token, phone) {
+  try {
+    const p = jwt.verify(String(token), JWT_SECRET);
+    return !!(p && p.purpose === 'voiceOk' && p.phone === phone);
+  } catch (_) { return false; }
+}
+
+// ---- rate limits (all keys include req.ip so express-rate-limit validations pass) ----
+const rlMsg = { error: 'చాలా ఎక్కువ ప్రయత్నాలు, కాసేపటి తర్వాత మళ్లీ ప్రయత్నించండి' };
+const limiter = o => rateLimit({ windowMs: 15 * 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false, message: rlMsg, ...o });
+const startLimiter = limiter({});
+const challengeLimiter = limiter({});
+const answerLimiter = limiter({ keyGenerator: req => `${ipKeyGenerator(req.ip)}|${(req.body && req.body.phone) || ''}` });
+const signupLimiter = limiter({});
+const loginLimiter = limiter({ keyGenerator: req => `${ipKeyGenerator(req.ip)}|${(req.body && req.body.phone) || ''}` });
+const audioLimiter = rateLimit({ windowMs: 60 * 1000, limit: 60, standardHeaders: true, legacyHeaders: false, message: rlMsg });
+// per-shop limit for STT/TTS so strangers can never burn Gnani credits
+const shopApiLimiter = rateLimit({
+  windowMs: 60 * 1000, limit: 60, standardHeaders: true, legacyHeaders: false, message: rlMsg,
+  keyGenerator: req => `${ipKeyGenerator(req.ip)}|${(req.shop && req.shop.id) || 'anon'}`,
+});
+
+// ---- Gnani TTS (same call the /api/tts route uses) ----
+async function gnaniTts(text) {
+  const r = await fetch(B + '/api/v1/tts/inference', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-API-Key-ID': K },
+    body: JSON.stringify({
+      text, voice: E.TTS_VOICE || 'Nalini', model: E.TTS_MODEL || 'timbre-v2.5',
+      language: E.TTS_LANG || 'te-IN', speed: 1.0,
+      audio_config: { sample_rate: 24000, num_channels: 1, sample_width: 2, encoding: 'linear_pcm', container: 'wav' },
+    }),
+  });
+  if (!r.ok) return { ok: false, status: r.status, text: await r.text() };
+  return { ok: true, status: r.status, buffer: Buffer.from(await r.arrayBuffer()) };
+}
+const sha1 = s => crypto.createHash('sha1').update(s, 'utf8').digest('hex');
+const inflight = new Map();
+// resolve a word to a cached .wav file, synthesizing at most once per word
+function wordAudio(word) {
+  const file = path.join(CACHE_DIR, sha1(word) + '.wav');
+  if (fs.existsSync(file)) return Promise.resolve(file);
+  if (inflight.has(sha1(word))) return inflight.get(sha1(word));
+  const p = (async () => {
+    const out = await gnaniTts(word);
+    if (!out.ok) throw Object.assign(new Error('TTS ' + out.status), { code: 'TTS_FAIL' });
+    const tmp = file + '.' + process.pid + '.tmp';
+    fs.writeFileSync(tmp, out.buffer);
+    fs.renameSync(tmp, file);
+    return file;
+  })().finally(() => inflight.delete(sha1(word)));
+  inflight.set(sha1(word), p);
+  return p;
+}
+
+// ---- Telugu kirana word bank (voice-word check) ----
+const WORDS = [
+  'కందిపప్పు', 'బియ్యం', 'పంచదార', 'ఉప్పు', 'నూనె', 'పాలు', 'పసుపు', 'కారం', 'గోధుమలు',
+  'చాయ్ పొడి', 'చింతపండు', 'ఉల్లిపాయలు', 'బంగాళదుంపలు', 'శనగపప్పు', 'మినపప్పు', 'పెసరపప్పు',
+  'జీలకర్ర', 'ఆవాలు', 'సబ్బు', 'బిస్కెట్లు', 'పెరుగు', 'వెన్న', 'బెల్లం', 'టమోటా', 'మిరపకాయలు',
+  'కొబ్బరి', 'అటుకులు', 'సేమ్యా', 'రవ్వ', 'గుడ్లు',
+];
+
+// challenges live ONLY in server memory: correct word never reaches the browser
+const challenges = new Map(); // id -> { phone, word, expiresAt, used }
+const CHALLENGE_TTL = 2 * 60 * 1000;
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, c] of challenges) if (c.expiresAt <= now) challenges.delete(id);
+}, 60 * 1000).unref();
+
+function pickOptions(word) {
+  const pool = WORDS.filter(w => w !== word);
+  for (let i = pool.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [pool[i], pool[j]] = [pool[j], pool[i]]; }
+  const opts = [word, pool[0], pool[1]];
+  for (let i = opts.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [opts[i], opts[j]] = [opts[j], opts[i]]; }
+  return opts;
+}
+
+// ---- AUTH (no OTP): phone + voice word + 4-digit PIN ----
+app.post('/api/auth/start', startLimiter, async (req, res) => {
+  const phone = String((req.body && req.body.phone) || '').trim();
+  if (!validPhone(phone)) return res.status(400).json({ error: '10 అంకెల సరైన మొబైల్ నంబర్ నమోదు చేయండి' });
+  try {
+    const { data, error } = await db().from('shops').select('id').eq('phone', phone).limit(1);
+    if (error) throw error;
+    res.json({ exists: !!(data && data.length) });
+  } catch (e) { fail(res, e, 'auth/start'); }
+});
+
+app.get('/api/auth/challenge', challengeLimiter, async (req, res) => {
+  const phone = String(req.query.phone || '').trim();
+  if (!validPhone(phone)) return res.status(400).json({ error: '10 అంకెల సరైన మొబైల్ నంబర్ నమోదు చేయండి' });
+  try {
+    const word = WORDS[Math.floor(Math.random() * WORDS.length)];
+    await wordAudio(word); // generate + cache (costs Gnani credits only once per word)
+    const challengeId = crypto.randomUUID();
+    challenges.set(challengeId, { phone, word, expiresAt: Date.now() + CHALLENGE_TTL, used: false });
+    res.json({ challengeId, audioUrl: '/api/auth/challenge/audio/' + challengeId, options: pickOptions(word) });
+  } catch (e) {
+    console.error('challenge', e.code || e.message);
+    res.status(502).json({ error: 'ధ్వని సిద్ధం కాలేదు, మళ్లీ ప్రయత్నించండి' });
+  }
+});
+
+// serves ONLY the word of that challenge (looked up in server memory, never from user input)
+app.get('/api/auth/challenge/audio/:challengeId', audioLimiter, (req, res) => {
+  const c = challenges.get(String(req.params.challengeId));
+  if (!c || c.expiresAt <= Date.now()) return res.status(404).json({ error: 'సవాలు ముగిసింది, మళ్లీ వినండి' });
+  const file = path.join(CACHE_DIR, sha1(c.word) + '.wav');
+  if (!fs.existsSync(file)) return res.status(404).json({ error: 'ఆడియో దొరకలేదు' });
+  res.set('Cache-Control', 'public, max-age=604800');
+  res.type('audio/wav').send(fs.readFileSync(file));
+});
+
+app.post('/api/auth/challenge/answer', answerLimiter, (req, res) => {
+  const b = req.body || {};
+  const bad = () => res.status(400).json({ error: 'సరిలేదు! కొత్త పదం విని మళ్లీ ప్రయత్నించండి' });
+  const c = challenges.get(String(b.challengeId || ''));
+  const phone = String(b.phone || '').trim();
+  // single use: missing, expired, already answered, or wrong phone -> rejected
+  if (!c || c.used || c.expiresAt <= Date.now() || !validPhone(phone) || phone !== c.phone) return bad();
+  if (String(b.choice || '').trim() !== c.word) { c.used = true; return bad(); } // wrong answer burns it
+  c.used = true;
+  const voiceOkToken = jwt.sign({ phone: c.phone, purpose: 'voiceOk' }, JWT_SECRET, { expiresIn: '5m' });
+  res.json({ voiceOkToken });
+});
+
+const SHOP_COLS = 'id, phone, owner_name, shop_name, address, voice_id, created_at';
+const profileCompleteOf = s => !!(s && s.owner_name && s.shop_name && s.address);
+
+app.post('/api/auth/signup', signupLimiter, async (req, res) => {
+  const b = req.body || {};
+  const phone = String(b.phone || '').trim();
+  const pin = String(b.pin == null ? '' : b.pin).trim();
+  if (!validPhone(phone)) return res.status(400).json({ error: '10 అంకెల సరైన మొబైల్ నంబర్ నమోదు చేయండి' });
+  if (!validPin(pin)) return res.status(400).json({ error: 'పిన్ ఖచ్చితంగా 4 అంకెలు ఉండాలి' });
+  if (!voiceOkPhone(b.voiceOkToken, phone)) return res.status(400).json({ error: 'ధ్వని ధృవీకరణ సరిలేదు, మళ్లీ ప్రయత్నించండి' });
+  try {
+    const ex = await db().from('shops').select('id').eq('phone', phone).limit(1);
+    if (ex.error) throw ex.error;
+    if (ex.data && ex.data.length) return res.status(409).json({ error: 'ఈ నంబర్‌తో ఇప్పటికే ఖాతా ఉంది, లాగిన్ అవ్వండి' });
+    const pin_hash = await bcrypt.hash(pin, 10);
+    const { data, error } = await db().from('shops').insert({
+      phone, pin_hash, owner_name: '', shop_name: '', address: '', failed_pin: 0,
+      created_at: new Date().toISOString(),
+    }).select(SHOP_COLS).single();
+    if (error) throw error;
+    setSession(res, data);
+    res.json({ ok: true, shop: data, profileComplete: profileCompleteOf(data) });
+  } catch (e) {
+    if (e && e.code === '23505') return res.status(409).json({ error: 'ఈ నంబర్‌తో ఇప్పటికే ఖాతా ఉంది, లాగిన్ అవ్వండి' });
+    fail(res, e, 'auth/signup');
+  }
+});
+
+app.post('/api/auth/login', loginLimiter, async (req, res) => {
+  const b = req.body || {};
+  const phone = String(b.phone || '').trim();
+  const pin = String(b.pin == null ? '' : b.pin).trim();
+  // generic message — never reveals whether the phone exists
+  const generic = () => res.status(401).json({ error: 'ఫోన్ నంబర్ లేదా పిన్ సరిలేదు' });
+  if (!validPhone(phone) || !validPin(pin)) return generic();
+  if (!voiceOkPhone(b.voiceOkToken, phone)) return res.status(400).json({ error: 'ధ్వని ధృవీకరణ సరిలేదు, మళ్లీ ప్రయత్నించండి' });
+  try {
+    const { data, error } = await db().from('shops')
+      .select(SHOP_COLS + ', pin_hash, failed_pin, locked_until')
+      .eq('phone', phone).limit(1);
+    if (error) throw error;
+    const shop = data && data[0];
+    if (!shop) return generic();
+    if (shop.locked_until && new Date(shop.locked_until).getTime() > Date.now()) {
+      return res.status(429).json({ error: 'చాలా ప్రయత్నాలు చేశారు. 15 నిమిషాల తర్వాత మళ్లీ ప్రయత్నించండి.' });
+    }
+    const okPin = await bcrypt.compare(pin, shop.pin_hash || '');
+    if (!okPin) {
+      const failed = (shop.failed_pin || 0) + 1;
+      const upd = { failed_pin: failed };
+      if (failed >= 5) upd.locked_until = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+      await db().from('shops').update(upd).eq('id', shop.id);
+      return generic();
+    }
+    if (shop.failed_pin || shop.locked_until) await db().from('shops').update({ failed_pin: 0, locked_until: null }).eq('id', shop.id);
+    const safe = { id: shop.id, phone: shop.phone, owner_name: shop.owner_name, shop_name: shop.shop_name, address: shop.address, voice_id: shop.voice_id, created_at: shop.created_at };
+    setSession(res, safe);
+    res.json({ ok: true, shop: safe, profileComplete: profileCompleteOf(safe) });
+  } catch (e) { fail(res, e, 'auth/login'); }
+});
+
+app.post('/api/auth/logout', (req, res) => { clearSession(res); res.json({ ok: true }); });
+
+// ---- requireAuth: every /api route except /api/auth/* ----
+function requireAuth(req, res, next) {
+  const token = req.signedCookies && req.signedCookies.session;
+  if (!token) return res.status(401).json({ error: 'లాగిన్ కావాలి' });
+  try {
+    const p = jwt.verify(token, JWT_SECRET);
+    if (!p || !p.shopId) throw new Error('no shop');
+    req.shop = { id: p.shopId, phone: p.phone }; // shop id comes from the session, never the body
+    next();
+  } catch (_) { res.status(401).json({ error: 'సెషన్ ముగిసింది, మళ్లీ లాగిన్ అవ్వండి' }); }
+}
+app.use('/api', requireAuth);
+
+app.get('/api/me', async (req, res) => {
+  try {
+    const { data, error } = await db().from('shops').select(SHOP_COLS).eq('id', req.shop.id).single();
+    if (error || !data) return res.status(404).json({ error: 'ఖాతా దొరకలేదు' });
+    res.json({ shop: data, profileComplete: profileCompleteOf(data) }); // never pin_hash
+  } catch (e) { fail(res, e, 'me/get'); }
+});
+
+app.put('/api/me', async (req, res) => {
+  const b = req.body || {};
+  const owner = String(b.owner_name == null ? '' : b.owner_name).trim();
+  const shopName = String(b.shop_name == null ? '' : b.shop_name).trim();
+  const address = String(b.address == null ? '' : b.address).trim();
+  if (!owner || !shopName || !address) return res.status(400).json({ error: 'అన్ని వివరాలు తప్పనిసరి' });
+  if (owner.length > 80 || shopName.length > 120 || address.length > 500) {
+    return res.status(400).json({ error: 'వివరాలు చాలా పొడవుగా ఉన్నాయి (పేరు 80, దుకాణం 120, చిరునామా 500 అక్షరాలు)' });
+  }
+  try {
+    const { data, error } = await db().from('shops')
+      .update({ owner_name: owner, shop_name: shopName, address })
+      .eq('id', req.shop.id).select(SHOP_COLS).single();
+    if (error) throw error;
+    res.json({ shop: data, profileComplete: true });
+  } catch (e) { fail(res, e, 'me/put'); }
+});
+
+// ---- STT (existing Gnani Prisma call, unchanged — now behind auth + per-shop limit) ----
+app.post('/api/stt', shopApiLimiter, express.raw({ type: () => true, limit: '5mb' }), async (req, res) => {
   if (!Buffer.isBuffer(req.body) || req.body.length < 1000) return res.status(400).json({ error: 'empty or invalid audio body' });
   console.log('STT audio bytes:', req.body.length, 'head:', req.body.slice(0, 4).toString('ascii'));
   try {
@@ -22,21 +309,111 @@ app.post('/api/stt', express.raw({ type: () => true, limit: '5mb' }), async (req
   } catch (e) { res.status(500).json({ error: String(e) }); }
 });
 
-app.post('/api/tts', express.json(), async (req, res) => {
+// ---- TTS (existing Gnani Timbre call, unchanged — now behind auth + per-shop limit) ----
+app.post('/api/tts', async (req, res) => {
   try {
-    const r = await fetch(B + '/api/v1/tts/inference', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-API-Key-ID': K },
-      body: JSON.stringify({
-        text: req.body.text, voice: E.TTS_VOICE || 'Nalini', model: E.TTS_MODEL || 'timbre-v2.5',
-        language: E.TTS_LANG || 'te-IN', speed: 1.0,
-        audio_config: { sample_rate: 24000, num_channels: 1, sample_width: 2, encoding: 'linear_pcm', container: 'wav' }
-      })
-    });
-    console.log('TTS', r.status); if (!r.ok) { const x = await r.text(); console.log(x.slice(0, 300)); return res.status(r.status).send(x); }
-    res.type('audio/wav').send(Buffer.from(await r.arrayBuffer()));
+    const out = await gnaniTts(String((req.body && req.body.text) || ''));
+    console.log('TTS', out.status);
+    if (!out.ok) { console.log((out.text || '').slice(0, 300)); return res.status(out.status).send(out.text); }
+    res.type('audio/wav').send(out.buffer);
   } catch (e) { res.status(500).json({ error: String(e) }); }
 });
 
+// ---- LEDGER (all scoped to the session shop) ----
+app.get('/api/customers', async (req, res) => {
+  try {
+    const [c, t] = await Promise.all([
+      db().from('customers').select('id, name, label, phone, aliases, created_at')
+        .eq('shop_id', req.shop.id).order('name', { ascending: true }),
+      db().from('transactions').select('customer_id, type, amount, created_at')
+        .eq('shop_id', req.shop.id),
+    ]);
+    if (c.error) throw c.error;
+    if (t.error) throw t.error;
+    const map = new Map((c.data || []).map(row => [row.id, { ...row, balance: 0, last_activity: null }]));
+    for (const tx of (t.data || [])) {
+      const cust = map.get(tx.customer_id);
+      if (!cust) continue;
+      const amt = Number(tx.amount) || 0;
+      cust.balance += tx.type === 'credit' ? amt : -amt; // balance = credit - pay
+      if (!cust.last_activity || new Date(tx.created_at) > new Date(cust.last_activity)) cust.last_activity = tx.created_at;
+    }
+    res.json([...map.values()]);
+  } catch (e) { fail(res, e, 'customers/get'); }
+});
+
+app.post('/api/customers', async (req, res) => {
+  const b = req.body || {};
+  const name = String(b.name == null ? '' : b.name).trim().replace(/\s+/g, ' ');
+  const label = b.label != null && String(b.label).trim() !== '' ? String(b.label).trim() : null;
+  const phone = b.phone != null && String(b.phone).trim() !== '' ? String(b.phone).trim() : null;
+  if (!name) return res.status(400).json({ error: 'కస్టమర్ పేరు తప్పనిసరి' });
+  if (name.length > 100) return res.status(400).json({ error: 'పేరు చాలా పొడవుగా ఉంది' });
+  if (label && label.length > 60) return res.status(400).json({ error: 'లేబుల్ చాలా పొడవుగా ఉంది' });
+  if (phone && !/^[+0-9]{7,15}$/.test(phone)) return res.status(400).json({ error: 'ఫోన్ నంబర్ సరిలేదు' });
+  try {
+    const { data, error } = await db().from('customers').insert({
+      shop_id: req.shop.id, name, label, phone, aliases: [], created_at: new Date().toISOString(),
+    }).select('id, name, label, phone, aliases, created_at').single();
+    if (error) throw error;
+    res.status(201).json({ ...data, balance: 0, last_activity: null });
+  } catch (e) { fail(res, e, 'customers/post'); }
+});
+
+app.post('/api/transactions', async (req, res) => {
+  const b = req.body || {};
+  const customerId = String(b.customer_id || '');
+  const type = b.type;
+  const amount = Number(b.amount);
+  const raw = b.raw_transcript != null ? String(b.raw_transcript).slice(0, 2000) : null;
+  if (!customerId) return res.status(400).json({ error: 'కస్టమర్‌ని ఎంచుకోండి' });
+  if (type !== 'credit' && type !== 'pay') return res.status(400).json({ error: 'రకం credit లేదా pay మాత్రమే' });
+  if (!Number.isInteger(amount) || amount <= 0) return res.status(400).json({ error: 'మొత్తం 0 కంటే ఎక్కువ ఉండాలి' });
+  try {
+    // customer must belong to THIS shop (session id, never the body)
+    const own = await db().from('customers').select('id').eq('id', customerId).eq('shop_id', req.shop.id).limit(1);
+    if (own.error) throw own.error;
+    if (!own.data || !own.data.length) return res.status(404).json({ error: 'కస్టమర్ దొరకలేదు' });
+    const { data, error } = await db().from('transactions').insert({
+      shop_id: req.shop.id, customer_id: customerId, type, amount, raw_transcript: raw,
+      created_at: new Date().toISOString(),
+    }).select('id, customer_id, type, amount, raw_transcript, created_at').single();
+    if (error) throw error;
+    res.status(201).json(data);
+  } catch (e) { fail(res, e, 'transactions/post'); }
+});
+
+// date interpreted in Asia/Kolkata (UTC+5:30)
+const istOffsetMs = (5 * 60 + 30) * 60 * 1000;
+const istToday = () => new Date(Date.now() + istOffsetMs).toISOString().slice(0, 10);
+app.get('/api/transactions', async (req, res) => {
+  let date = typeof req.query.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(req.query.date) ? req.query.date : istToday();
+  const [y, m, d] = date.split('-').map(Number);
+  const probe = new Date(Date.UTC(y, m - 1, d));
+  if (probe.getUTCFullYear() !== y || probe.getUTCMonth() !== m - 1 || probe.getUTCDate() !== d) {
+    return res.status(400).json({ error: 'తేదీ సరిలేదు (YYYY-MM-DD)' });
+  }
+  const start = new Date(probe.getTime() - istOffsetMs);      // IST midnight -> UTC
+  const end = new Date(start.getTime() + 24 * 60 * 60 * 1000);
+  try {
+    const [t, c] = await Promise.all([
+      db().from('transactions').select('id, customer_id, type, amount, raw_transcript, created_at')
+        .eq('shop_id', req.shop.id)
+        .gte('created_at', start.toISOString()).lt('created_at', end.toISOString())
+        .order('created_at', { ascending: false }),
+      db().from('customers').select('id, name').eq('shop_id', req.shop.id),
+    ]);
+    if (t.error) throw t.error;
+    if (c.error) throw c.error;
+    const names = new Map((c.data || []).map(x => [x.id, x.name]));
+    const transactions = (t.data || []).map(x => ({ ...x, customer_name: names.get(x.customer_id) || null }));
+    res.json({ date, transactions });
+  } catch (e) { fail(res, e, 'transactions/get'); }
+});
+
 console.log('API key loaded:', K ? K.length + ' chars' : 'MISSING', K === 'your_key_here' ? '(STILL THE PLACEHOLDER!)' : '');
-app.listen(E.PORT || 3000, () => console.log('Khata Vani on http://localhost:' + (E.PORT || 3000)));
+console.log('Supabase:', sb ? 'configured' : 'NOT CONFIGURED (set SUPABASE_URL + key in .env)');
+app.listen(PORT, () => console.log('Khata Vani on http://localhost:' + PORT));
+
+
+

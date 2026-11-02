@@ -1,4 +1,5 @@
 .env
 node_modules/
 data/
+data/tts-cache/
 *.log

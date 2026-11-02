@@ -1,66 +1,19 @@
-<!doctype html><html lang="te"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>ఖాతా వాణి</title>
-<style>
-body{font-family:system-ui,sans-serif;margin:0;background:#fff8e7;color:#222;text-align:center}
-h1{background:#0a7d4b;color:#fff;margin:0;padding:14px;font-size:22px}
-#mic{width:170px;height:170px;border-radius:50%;border:0;font-size:64px;background:#0a7d4b;color:#fff;margin:24px auto 8px;display:block}
-#mic.rec{background:#d32f2f;animation:p 1s infinite}@keyframes p{50%{transform:scale(1.07)}}
-#say{font-size:20px;min-height:56px;padding:0 14px}
-#ok button{font-size:42px;width:44%;padding:14px;margin:6px;border:0;border-radius:14px}
-#yes{background:#0a7d4b;color:#fff}#no{background:#d32f2f;color:#fff}
-ul{list-style:none;padding:0;margin:14px auto;max-width:460px}
-li{display:flex;justify-content:space-between;align-items:center;background:#fff;margin:6px 10px;padding:12px;border-radius:12px;font-size:19px}
-li button{font-size:15px;padding:8px 12px;border-radius:10px;border:1px solid #0a7d4b;background:#fff;color:#0a7d4b}
-</style></head><body>
-<h1>ఖాతా వాణి · Khata Vani</h1>
-<button id="mic">🎤</button>
-<div id="say">నొక్కి మాట్లాడండి (Tap and speak)</div>
-<div id="ok" hidden><button id="yes">✅</button><button id="no">❌</button></div>
-<pre id="dbg" style="font-size:12px;white-space:pre-wrap;text-align:left;padding:0 12px;color:#555"></pre><ul id="list"></ul>
+<!doctype html>
+<html lang="te">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#0a7d4b">
+<title>ఖాతా వాణి</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+Telugu:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div id="app"></div>
 <script src="parser.js"></script>
-<script>
-const $=id=>document.getElementById(id);
-let ledger=JSON.parse(localStorage.getItem('kv')||'{}'),pending=null,rec=null,chunks=[],timer;
-const save=()=>{localStorage.setItem('kv',JSON.stringify(ledger));draw()};
-const say=m=>$('say').textContent=m;
-async function speak(text){
-  say(text);
-  const r=await fetch('/api/tts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text})});
-  if(!r.ok){say('TTS error: '+await r.text());return null}
-  const b=await r.blob();const a=new Audio(URL.createObjectURL(b));await a.play().catch(()=>{});return b;
-}
-function wav(d,sr){const v=new DataView(new ArrayBuffer(44+d.length*2)),w=(o,s)=>[...s].forEach((c,i)=>v.setUint8(o+i,c.charCodeAt(0)));
-  w(0,'RIFF');v.setUint32(4,36+d.length*2,true);w(8,'WAVEfmt ');v.setUint32(16,16,true);v.setUint16(20,1,true);v.setUint16(22,1,true);
-  v.setUint32(24,sr,true);v.setUint32(28,sr*2,true);v.setUint16(32,2,true);v.setUint16(34,16,true);w(36,'data');v.setUint32(40,d.length*2,true);
-  d.forEach((x,i)=>v.setInt16(44+i*2,Math.max(-1,Math.min(1,x))*32767,true));return v.buffer}
-async function toWav(blob){
-  const dec=await new AudioContext().decodeAudioData(await blob.arrayBuffer());
-  const off=new OfflineAudioContext(1,Math.ceil(dec.duration*16000),16000),s=off.createBufferSource();
-  s.buffer=dec;s.connect(off.destination);s.start();return wav((await off.startRendering()).getChannelData(0),16000)}
-$('mic').onclick=async()=>{
-  if(rec){rec.stop();return}
-  $('ok').hidden=true;
-  const st=await navigator.mediaDevices.getUserMedia({audio:true});
-  rec=new MediaRecorder(st);chunks=[];
-  rec.ondataavailable=e=>chunks.push(e.data);
-  rec.onstop=async()=>{clearTimeout(timer);st.getTracks().forEach(t=>t.stop());rec=null;$('mic').classList.remove('rec');say('…');
-    try{const r=await fetch('/api/stt',{method:'POST',headers:{'Content-Type':'audio/wav'},body:await toWav(new Blob(chunks))});const x=await r.text();
-    $('dbg').textContent='STT '+r.status+': '+x.slice(0,300);let j={};try{j=JSON.parse(x)}catch(e){}
-    if(!j.transcript){say('వినపడలేదు, మళ్లీ చెప్పండి');return}$('dbg').textContent+=' | '+JSON.stringify(parse(j.transcript));handle(parse(j.transcript))}
-    catch(e){say('Error');$('dbg').textContent='ERR: '+e}};
-  rec.start();$('mic').classList.add('rec');say('వింటున్నాను…');timer=setTimeout(()=>rec&&rec.stop(),20000)};
-async function handle(p){
-  if(p.type==='query'&&p.name){return speak(`${p.name} బాకీ ${ledger[p.name]||0} రూపాయలు.`)}
-  if(!p.type||!p.amount||!p.name){return speak('అర్థం కాలేదు, మళ్లీ చెప్పండి.')}
-  pending=p;$('ok').hidden=false;
-  speak(`${p.name}, ${p.amount} రూపాయలు ${p.type==='credit'?'ఉద్దెర':'జమ'}. సరిగ్గా ఉందా?`)}
-$('yes').onclick=()=>{if(!pending)return;const{name,amount,type}=pending;
-  ledger[name]=(ledger[name]||0)+(type==='credit'?amount:-amount);pending=null;$('ok').hidden=true;save();speak('నమోదు చేశాను.')};
-$('no').onclick=()=>{pending=null;$('ok').hidden=true;speak('సరే, మళ్లీ చెప్పండి.')};
-async function remind(n){const b=await speak(`${n} గారూ, మీ ${ledger[n]} రూపాయల బాకీ ఉంది. వీలైనప్పుడు ఇవ్వగలరు, ధన్యవాదాలు.`);
-  if(b){const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=n+'-reminder.wav';a.click()}}
-function draw(){$('list').innerHTML='';Object.entries(ledger).filter(([,v])=>v>0).forEach(([n,v])=>{
-  const li=document.createElement('li');li.innerHTML=`<span>${n}: ₹${v}</span>`;
-  const b=document.createElement('button');b.textContent='🔊 రిమైండర్';b.onclick=()=>remind(n);li.append(b);$('list').append(li)})}
-draw();
-</script></body></html>
+<script src="api.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
