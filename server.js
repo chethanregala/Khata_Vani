@@ -8,6 +8,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { createClient } = require('@supabase/supabase-js');
+const { requestId, securityHeaders, sameOrigin, contentLength, errorHandler, validateJwtSecret } = require('./security.js');
 
 const app = express();
 const B = 'https://api.vachana.ai', K = process.env.GNANI_API_KEY;
@@ -17,7 +18,16 @@ const PROD = E.NODE_ENV === 'production';
 const JWT_SECRET = E.JWT_SECRET;
 
 // ---- config checks (never print secret values) ----
-if (!JWT_SECRET) { console.error('FATAL: JWT_SECRET is missing in .env'); process.exit(1); }
+// weak/placeholder secrets are fatal only in production; dev just warns
+const jwtCheck = validateJwtSecret(JWT_SECRET, { production: PROD });
+if (jwtCheck.level === 'fatal') { console.error('FATAL: ' + jwtCheck.message); process.exit(1); }
+if (jwtCheck.level === 'warn') console.warn('WARN: ' + jwtCheck.message);
+
+// optional: TRUST_PROXY=1 only when behind a trusted reverse proxy, so rate
+// limits see real client IPs instead of the proxy's single IP (default: off)
+if (E.TRUST_PROXY) {
+  app.set('trust proxy', /^\d+$/.test(String(E.TRUST_PROXY)) ? Number(E.TRUST_PROXY) : String(E.TRUST_PROXY) === 'true');
+}
 
 // Supabase — server-side only. URL/key are never sent to the browser or logged.
 // Accepts SUPABASE_SERVICE_KEY or SUPABASE_SECRET_KEY (Supabase's newer name).
@@ -30,19 +40,40 @@ const db = () => {
   if (!sb) { const e = new Error('supabase not configured'); e.code = 'NO_SUPA'; throw e; }
   return sb;
 };
-// shared error responder: Telugu message to the caller, details only to server log
+// shared error responder: Telugu message to the caller, only a non-sensitive
+// error category + route + request id to the server log (never message bodies,
+// PII, transcripts or upstream payloads)
 function fail(res, e, ctx) {
   if (e && e.code === 'NO_SUPA') return res.status(503).json({ error: 'డేటాబేస్ అమరిక లేదు, యజమానిని సంప్రదించండి' });
-  console.error(ctx, e && (e.code || e.message));
+  const rid = (res.locals && res.locals.reqId) || '-';
+  console.error('[fail] ' + ctx + ' id=' + rid + ' err=' + ((e && (e.code || e.name)) || 'ERROR'));
   return res.status(500).json({ error: 'సర్వర్ సమస్య, మళ్లీ ప్రయత్నించండి' });
 }
 
 // TTS word cache: data/tts-cache/<sha1(word)>.wav — each word is synthesized once.
-const CACHE_DIR = path.join(__dirname, 'data', 'tts-cache');
+// TTS_CACHE_DIR overrides the location (test-security.js points it at a temp
+// dir so tests never write into the real cache); default behavior unchanged.
+const CACHE_DIR = E.TTS_CACHE_DIR || path.join(__dirname, 'data', 'tts-cache');
 fs.mkdirSync(CACHE_DIR, { recursive: true });
 
+// security middleware chain: correlation id -> headers -> same-origin (CSRF)
+// -> static -> JSON body (64kb cap) -> signed cookies
+app.disable('x-powered-by');
+app.use(requestId);
+app.use(securityHeaders({ production: PROD }));
+app.use(sameOrigin({ allowedOrigins: String(E.APP_ORIGIN || '').split(',').map(s => s.trim()).filter(Boolean) }));
 app.use(express.static('public'));
-app.use(express.json());
+// STT receives audio bytes (parsed by express.raw inside the route), so reject
+// wrong content types BEFORE the JSON parser ever reads the body — otherwise a
+// malformed "application/json" body would surface as a parse error instead of 415
+app.use((req, res, next) => {
+  if (req.method === 'POST' && req.path === '/api/stt' &&
+      String(req.get('Content-Type') || '').toLowerCase().indexOf('audio/') !== 0) {
+    return res.status(415).json({ error: 'ఆడియో ఫైల్ మాత్రమే పంపాలి · audio content required' });
+  }
+  next();
+});
+app.use(express.json({ limit: '64kb' }));
 app.use(cookieParser(JWT_SECRET));
 
 // ---- small validators ----
@@ -60,7 +91,11 @@ function setSession(res, shop) {
 function clearSession(res) {
   res.clearCookie('session', { httpOnly: true, sameSite: 'lax', signed: true, secure: PROD, path: '/' });
 }
-// voiceOk token: proves the challenge word was heard; 5 minutes, bound to phone
+// voiceOk token: proves the challenge word was heard; 5 minutes, bound to phone.
+// IMPORTANT: this authenticates completion of the audio interaction (a human
+// heard the word and picked it) — it does NOT prove ownership of the phone
+// number. Proper phone verification (OTP) is a documented future requirement
+// (see SECURITY-HARDENING.md).
 function voiceOkPhone(token, phone) {
   try {
     const p = jwt.verify(String(token), JWT_SECRET);
@@ -82,20 +117,40 @@ const shopApiLimiter = rateLimit({
   windowMs: 60 * 1000, limit: 60, standardHeaders: true, legacyHeaders: false, message: rlMsg,
   keyGenerator: req => `${ipKeyGenerator(req.ip)}|${(req.shop && req.shop.id) || 'anon'}`,
 });
+// TTS: same policy as STT (60/min) but a separate bucket, so a TTS burst can
+// never starve speech recognition (or vice versa) for the same shop
+const ttsApiLimiter = rateLimit({
+  windowMs: 60 * 1000, limit: 60, standardHeaders: true, legacyHeaders: false, message: rlMsg,
+  keyGenerator: req => `${ipKeyGenerator(req.ip)}|${(req.shop && req.shop.id) || 'anon'}`,
+});
 
 // ---- Gnani TTS (same call the /api/tts route uses) ----
+// Explicit upstream timeouts; failures are returned as a kind + status only —
+// the provider response body is never kept, logged or forwarded to clients.
+const TTS_TIMEOUT_MS = 15000, STT_TIMEOUT_MS = 30000;
+const timedOut = e => !!(e && (e.name === 'TimeoutError' || e.name === 'AbortError'));
 async function gnaniTts(text) {
-  const r = await fetch(B + '/api/v1/tts/inference', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-API-Key-ID': K },
-    body: JSON.stringify({
-      text, voice: E.TTS_VOICE || 'Nalini', model: E.TTS_MODEL || 'timbre-v2.5',
-      language: E.TTS_LANG || 'te-IN', speed: 1.0,
-      audio_config: { sample_rate: 24000, num_channels: 1, sample_width: 2, encoding: 'linear_pcm', container: 'wav' },
-    }),
-  });
-  if (!r.ok) return { ok: false, status: r.status, text: await r.text() };
-  return { ok: true, status: r.status, buffer: Buffer.from(await r.arrayBuffer()) };
+  let r;
+  try {
+    r = await fetch(B + '/api/v1/tts/inference', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-API-Key-ID': K },
+      body: JSON.stringify({
+        text, voice: E.TTS_VOICE || 'Nalini', model: E.TTS_MODEL || 'timbre-v2.5',
+        language: E.TTS_LANG || 'te-IN', speed: 1.0,
+        audio_config: { sample_rate: 24000, num_channels: 1, sample_width: 2, encoding: 'linear_pcm', container: 'wav' },
+      }),
+      signal: AbortSignal.timeout(TTS_TIMEOUT_MS),
+    });
+  } catch (e) {
+    return { ok: false, kind: timedOut(e) ? 'timeout' : 'network' };
+  }
+  if (!r.ok) return { ok: false, kind: 'upstream', status: r.status };
+  try {
+    return { ok: true, status: r.status, buffer: Buffer.from(await r.arrayBuffer()) };
+  } catch (e) {
+    return { ok: false, kind: timedOut(e) ? 'timeout' : 'network' };
+  }
 }
 const sha1 = s => crypto.createHash('sha1').update(s, 'utf8').digest('hex');
 const inflight = new Map();
@@ -106,7 +161,10 @@ function wordAudio(word) {
   if (inflight.has(sha1(word))) return inflight.get(sha1(word));
   const p = (async () => {
     const out = await gnaniTts(word);
-    if (!out.ok) throw Object.assign(new Error('TTS ' + out.status), { code: 'TTS_FAIL' });
+    if (!out.ok) {
+      throw Object.assign(new Error('TTS ' + (out.kind || out.status || 'fail')),
+        { code: out.kind === 'timeout' ? 'TTS_TIMEOUT' : 'TTS_FAIL' });
+    }
     const tmp = file + '.' + process.pid + '.tmp';
     fs.writeFileSync(tmp, out.buffer);
     fs.renameSync(tmp, file);
@@ -124,7 +182,11 @@ const WORDS = [
   'కొబ్బరి', 'అటుకులు', 'సేమ్యా', 'రవ్వ', 'గుడ్లు',
 ];
 
-// challenges live ONLY in server memory: correct word never reaches the browser
+// challenges live ONLY in server memory: which option is correct is never told
+// to the browser (the 3 option texts include the right word — only the audio
+// reveals which one). Completing it proves the audio interaction happened — it
+// is NOT proof of phone-number ownership (no OTP/provider is configured; see
+// SECURITY-HARDENING.md)
 const challenges = new Map(); // id -> { phone, word, expiresAt, used }
 const CHALLENGE_TTL = 2 * 60 * 1000;
 setInterval(() => {
@@ -140,7 +202,11 @@ function pickOptions(word) {
   return opts;
 }
 
-// ---- AUTH (no OTP): phone + voice word + 4-digit PIN ----
+// ---- AUTH: phone + voice-word challenge + 4-digit PIN (no OTP) ----
+// The spoken-word challenge verifies that the login session completed the
+// audio interaction; it does NOT verify ownership of the phone number.
+// Phone-ownership verification (OTP) is a future requirement — see
+// SECURITY-HARDENING.md. Do not describe this flow as phone verification.
 app.post('/api/auth/start', startLimiter, async (req, res) => {
   const phone = String((req.body && req.body.phone) || '').trim();
   if (!validPhone(phone)) return res.status(400).json({ error: '10 అంకెల సరైన మొబైల్ నంబర్ నమోదు చేయండి' });
@@ -161,8 +227,9 @@ app.get('/api/auth/challenge', challengeLimiter, async (req, res) => {
     challenges.set(challengeId, { phone, word, expiresAt: Date.now() + CHALLENGE_TTL, used: false });
     res.json({ challengeId, audioUrl: '/api/auth/challenge/audio/' + challengeId, options: pickOptions(word) });
   } catch (e) {
-    console.error('challenge', e.code || e.message);
-    res.status(502).json({ error: 'ధ్వని సిద్ధం కాలేదు, మళ్లీ ప్రయత్నించండి' });
+    console.error('challenge id=' + (req.id || '-') + ' ' + (e && (e.code || e.name) || 'ERROR'));
+    res.status(e && e.code === 'TTS_TIMEOUT' ? 504 : 502)
+      .json({ error: 'ధ్వని సిద్ధం కాలేదు, మళ్లీ ప్రయత్నించండి' });
   }
 });
 
@@ -291,32 +358,85 @@ app.put('/api/me', async (req, res) => {
   } catch (e) { fail(res, e, 'me/put'); }
 });
 
-// ---- STT (existing Gnani Prisma call, unchanged — now behind auth + per-shop limit) ----
+// ---- STT (Gnani Prisma proxy: auth + per-shop limit + timeout, no raw
+// provider payloads or transcripts are ever logged or forwarded) ----
+const STT_FAIL_MSG = 'గుర్తించడం సాధ్యం కాలేదు, మళ్లీ చెప్పండి · transcription failed';
+const STT_TIMEOUT_MSG = 'గుర్తించడానికి సమయం ఎక్కువైంది, మళ్లీ చెప్పండి · transcription timed out';
 app.post('/api/stt', shopApiLimiter, express.raw({ type: () => true, limit: '5mb' }), async (req, res) => {
-  if (!Buffer.isBuffer(req.body) || req.body.length < 1000) return res.status(400).json({ error: 'empty or invalid audio body' });
-  console.log('STT audio bytes:', req.body.length, 'head:', req.body.slice(0, 4).toString('ascii'));
+  const ct = String(req.get('Content-Type') || '').toLowerCase();
+  if (ct.indexOf('audio/') !== 0) return res.status(415).json({ error: 'ఆడియో ఫైల్ మాత్రమే పంపాలి · audio content required' });
+  if (!Buffer.isBuffer(req.body) || req.body.length < 1000) {
+    return res.status(400).json({ error: 'ఆడియో ఖాళీ/చాలా చిన్నది · empty or invalid audio body' });
+  }
   try {
     const f = new FormData();
     f.append('audio_file', new Blob([req.body], { type: 'audio/wav' }), 'a.wav');
     f.append('model', 'prisma-v3.0');
     f.append('format', 'transcribe');
     f.append('language_code', E.STT_LANG || 'indic-auto');
-    const r = await fetch(B + '/stt/v3', { method: 'POST', headers: { 'X-API-Key-ID': K }, body: f });
-    const x = await r.text(); console.log('STT', r.status, x.slice(0, 300));
-    let tr = ''; try { tr = JSON.parse(x).transcript || ''; } catch (_) {}
-    console.log('STT transcript raw:', JSON.stringify(tr));
-    res.status(r.status).type('json').send(x);
-  } catch (e) { res.status(500).json({ error: String(e) }); }
+    let r;
+    try {
+      r = await fetch(B + '/stt/v3', {
+        method: 'POST', headers: { 'X-API-Key-ID': K }, body: f,
+        signal: AbortSignal.timeout(STT_TIMEOUT_MS),
+      });
+    } catch (e) {
+      console.error('[stt] id=' + req.id + ' upstream ' + (timedOut(e) ? 'timeout' : 'network-error'));
+      return res.status(timedOut(e) ? 504 : 502).json({ error: timedOut(e) ? STT_TIMEOUT_MSG : STT_FAIL_MSG });
+    }
+    if (!r.ok) {
+      // never forward raw provider errors — map to a safe status + Telugu message
+      console.error('[stt] id=' + req.id + ' upstream-status=' + r.status);
+      return res.status(502).json({ error: STT_FAIL_MSG });
+    }
+    let j = null;
+    try { j = JSON.parse(await r.text()); } catch (_) {}
+    if (!j || typeof j.transcript !== 'string') {
+      console.error('[stt] id=' + req.id + ' invalid-upstream-response');
+      return res.status(502).json({ error: STT_FAIL_MSG });
+    }
+    console.log('[stt] id=' + req.id + ' upstream=200 transcript_chars=' + j.transcript.length);
+    // forward only the fields the client uses — not the whole provider payload
+    return res.json({ transcript: j.transcript, detected_language_code: j.detected_language_code || null });
+  } catch (e) {
+    console.error('[stt] id=' + req.id + ' ' + (e && (e.code || e.name) || 'ERROR'));
+    return res.status(500).json({ error: 'సర్వర్ సమస్య, మళ్లీ ప్రయత్నించండి' });
+  }
 });
 
-// ---- TTS (existing Gnani Timbre call, unchanged — now behind auth + per-shop limit) ----
-app.post('/api/tts', async (req, res) => {
-  try {
-    const out = await gnaniTts(String((req.body && req.body.text) || ''));
-    console.log('TTS', out.status);
-    if (!out.ok) { console.log((out.text || '').slice(0, 300)); return res.status(out.status).send(out.text); }
-    res.type('audio/wav').send(out.buffer);
-  } catch (e) { res.status(500).json({ error: String(e) }); }
+// ---- TTS (Gnani Timbre proxy: auth + per-shop 60/min limit + strict body
+// validation, so strangers can never consume Gnani credits) ----
+const TTS_TEXT_MAX = 1000;
+const TTS_FAIL_MSG = 'ధ్వని సిద్ధం కాలేదు, మళ్లీ ప్రయత్నించండి · speech service failed';
+const TTS_TIMEOUT_MSG = 'ధ్వని సేవ సమయం ముగిసింది, మళ్లీ ప్రయత్నించండి · speech service timed out';
+app.post('/api/tts', ttsApiLimiter, contentLength(8 * 1024), async (req, res) => {
+  const ct = String(req.get('Content-Type') || '').toLowerCase();
+  if (ct.indexOf('application/json') !== 0) {
+    return res.status(415).json({ error: 'JSON అభ్యర్థన కావాలి · application/json required' });
+  }
+  const b = req.body;
+  if (!b || typeof b !== 'object' || Array.isArray(b)) {
+    return res.status(400).json({ error: 'సరైన అభ్యర్థన నిర్మాణం కాదు · invalid request body' });
+  }
+  if (typeof b.text !== 'string') {
+    return res.status(400).json({ error: 'టెక్స్ట్ పాఠ్యంగా ఉండాలి · text must be a string' });
+  }
+  if (!b.text.trim()) {
+    return res.status(400).json({ error: 'టెక్స్ట్ ఖాలీగా ఉంది · text is empty' });
+  }
+  if (b.text.length > TTS_TEXT_MAX) {
+    return res.status(400).json({
+      error: `టెక్స్ట్ ${TTS_TEXT_MAX} అక్షరాల లోపల ఉండాలి · max ${TTS_TEXT_MAX} characters`,
+    });
+  }
+  const out = await gnaniTts(b.text.trim());
+  if (!out.ok) {
+    console.error('[tts] id=' + req.id + ' upstream ' + out.kind + (out.status ? ' status=' + out.status : ''));
+    return res.status(out.kind === 'timeout' ? 504 : 502)
+      .json({ error: out.kind === 'timeout' ? TTS_TIMEOUT_MSG : TTS_FAIL_MSG });
+  }
+  console.log('[tts] id=' + req.id + ' upstream=200 bytes=' + out.buffer.length);
+  res.type('audio/wav').send(out.buffer);
 });
 
 // ---- LEDGER (all scoped to the session shop) ----
@@ -553,9 +673,20 @@ app.get('/api/transactions', async (req, res) => {
   } catch (e) { fail(res, e, 'transactions/get'); }
 });
 
-console.log('API key loaded:', K ? K.length + ' chars' : 'MISSING', K === 'your_key_here' ? '(STILL THE PLACEHOLDER!)' : '');
+// ---- startup: log configuration STATE only, never values ----
+console.log('Gnani API key:', K ? 'configured' : 'MISSING', K === 'your_key_here' ? '(STILL THE PLACEHOLDER!)' : '');
 console.log('Supabase:', sb ? 'configured' : 'NOT CONFIGURED (set SUPABASE_URL + key in .env)');
-app.listen(PORT, () => console.log('Khata Vani on http://localhost:' + PORT));
+
+// unmatched /api routes -> JSON 404 (registered after every route)
+app.use('/api', (req, res) => res.status(404).json({ error: 'రూట్ దొరకలేదు · route not found' }));
+// last-resort error handler: JSON only, no stack traces, non-sensitive logging
+app.use(errorHandler());
+
+// listen only when run directly (tests require the app without binding a port)
+if (require.main === module) {
+  app.listen(PORT, () => console.log('Khata Vani on http://localhost:' + PORT));
+}
+module.exports = { app };
 
 
 
