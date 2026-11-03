@@ -330,13 +330,17 @@ app.get('/api/customers', async (req, res) => {
     ]);
     if (c.error) throw c.error;
     if (t.error) throw t.error;
-    const map = new Map((c.data || []).map(row => [row.id, { ...row, balance: 0, last_activity: null }]));
+    // balance, last_activity, last_payment_at (latest 'pay' transaction or null)
+    const map = new Map((c.data || []).map(row => [row.id, { ...row, balance: 0, last_activity: null, last_payment_at: null }]));
     for (const tx of (t.data || [])) {
       const cust = map.get(tx.customer_id);
       if (!cust) continue;
       const amt = Number(tx.amount) || 0;
       cust.balance += tx.type === 'credit' ? amt : -amt; // balance = credit - pay
       if (!cust.last_activity || new Date(tx.created_at) > new Date(cust.last_activity)) cust.last_activity = tx.created_at;
+      if (tx.type === 'pay' && (!cust.last_payment_at || new Date(tx.created_at) > new Date(cust.last_payment_at))) {
+        cust.last_payment_at = tx.created_at;
+      }
     }
     res.json([...map.values()]);
   } catch (e) { fail(res, e, 'customers/get'); }
@@ -383,18 +387,156 @@ app.post('/api/transactions', async (req, res) => {
   } catch (e) { fail(res, e, 'transactions/post'); }
 });
 
+// ---- customer helpers: every id from the client is re-checked against THIS shop ----
+const CUST_COLS = 'id, name, label, phone, aliases, created_at';
+async function ownCustomer(req, id) {
+  const { data, error } = await db().from('customers').select(CUST_COLS)
+    .eq('id', String(id == null ? '' : id)).eq('shop_id', req.shop.id).limit(1);
+  if (error) throw error;
+  return (data && data[0]) || null;
+}
+const squeeze = v => String(v == null ? '' : v).trim().replace(/\s+/g, ' ');
+
+// PATCH /api/customers/:id — edit name / label / phone / aliases
+app.patch('/api/customers/:id', async (req, res) => {
+  const b = req.body || {};
+  try {
+    const cur = await ownCustomer(req, req.params.id);
+    if (!cur) return res.status(404).json({ error: 'కస్టమర్ దొరకలేదు' });
+    const upd = {};
+    if (b.name !== undefined) {
+      const n = squeeze(b.name);
+      if (!n) return res.status(400).json({ error: 'కస్టమర్ పేరు తప్పనిసరి' });
+      if (n.length > 100) return res.status(400).json({ error: 'పేరు చాలా పొడవుగా ఉంది' });
+      upd.name = n;
+    }
+    if (b.label !== undefined) {
+      const l = squeeze(b.label);
+      if (l.length > 60) return res.status(400).json({ error: 'లేబుల్ చాలా పొడవుగా ఉంది' });
+      upd.label = l || null;
+    }
+    if (b.phone !== undefined) {
+      const p = squeeze(b.phone);
+      if (p && !/^[+0-9]{7,15}$/.test(p)) return res.status(400).json({ error: 'ఫోన్ నంబర్ సరిలేదు' });
+      upd.phone = p || null;
+    }
+    if (b.aliases !== undefined) {
+      if (!Array.isArray(b.aliases)) return res.status(400).json({ error: 'మారుపేర్లు జాబితాలో ఉండాలి' });
+      const seen = new Set([squeeze(cur.name).toLowerCase()]);
+      upd.aliases = [];
+      for (const a of b.aliases) {
+        const s = squeeze(a);
+        const k = s.toLowerCase();
+        if (!s || s.length > 100 || seen.has(k)) continue;
+        seen.add(k);
+        upd.aliases.push(s);
+        if (upd.aliases.length >= 20) break;
+      }
+    }
+    if (!Object.keys(upd).length) return res.status(400).json({ error: 'మార్పు ఏమీ లేదు' });
+    const { data, error } = await db().from('customers').update(upd)
+      .eq('id', cur.id).eq('shop_id', req.shop.id).select(CUST_COLS).single();
+    if (error) throw error;
+    res.json(data);
+  } catch (e) { fail(res, e, 'customers/patch'); }
+});
+
+// POST /api/customers/merge — move remove_id's transactions onto keep_id, then delete it
+app.post('/api/customers/merge', async (req, res) => {
+  const b = req.body || {};
+  const keepId = String(b.keep_id || ''), removeId = String(b.remove_id || '');
+  if (!keepId || !removeId) return res.status(400).json({ error: 'రెండు కస్టమర్ల ఐడీలు కావాలి' });
+  if (keepId === removeId) return res.status(400).json({ error: 'ఒకే కస్టమర్‌ని కలపలేము' });
+  try {
+    const [keep, remove] = await Promise.all([ownCustomer(req, keepId), ownCustomer(req, removeId)]);
+    if (!keep || !remove) return res.status(404).json({ error: 'కస్టమర్ దొరకలేదు' });
+    const { error: e1 } = await db().from('transactions').update({ customer_id: keep.id })
+      .eq('shop_id', req.shop.id).eq('customer_id', remove.id);
+    if (e1) throw e1;
+    // removed name + aliases become aliases of the kept customer (deduped, capped)
+    const seen = new Set([squeeze(keep.name).toLowerCase()]);
+    const aliases = [];
+    for (const a of [...(keep.aliases || []), remove.name, ...(remove.aliases || [])]) {
+      const s = squeeze(a), k = s.toLowerCase();
+      if (!s || s.length > 100 || seen.has(k)) continue;
+      seen.add(k); aliases.push(s);
+      if (aliases.length >= 20) break;
+    }
+    const { error: e2 } = await db().from('customers').update({ aliases }).eq('id', keep.id).eq('shop_id', req.shop.id);
+    if (e2) throw e2;
+    const { error: e3 } = await db().from('customers').delete().eq('id', remove.id).eq('shop_id', req.shop.id);
+    if (e3) throw e3;
+    const customer = await ownCustomer(req, keep.id);
+    res.json({ ok: true, customer });
+  } catch (e) { fail(res, e, 'customers/merge'); }
+});
+
+// GET /api/customers/:id/transactions — that customer's entries, newest first
+app.get('/api/customers/:id/transactions', async (req, res) => {
+  try {
+    const c = await ownCustomer(req, req.params.id);
+    if (!c) return res.status(404).json({ error: 'కస్టమర్ దొరకలేదు' });
+    const { data, error } = await db().from('transactions')
+      .select('id, customer_id, type, amount, raw_transcript, created_at')
+      .eq('shop_id', req.shop.id).eq('customer_id', c.id)
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+    res.json({ customer: c, transactions: data || [] });
+  } catch (e) { fail(res, e, 'customers/tx'); }
+});
+
+// DELETE /api/transactions/:id — undo a mistake: only entries created today (IST)
+app.delete('/api/transactions/:id', async (req, res) => {
+  try {
+    const { data, error } = await db().from('transactions').select('id, created_at')
+      .eq('id', String(req.params.id)).eq('shop_id', req.shop.id).limit(1);
+    if (error) throw error;
+    const tx = data && data[0];
+    if (!tx) return res.status(404).json({ error: 'నమోదు దొరకలేదు' });
+    const range = istDayRange(istToday());
+    const at = new Date(tx.created_at).getTime();
+    if (!(at >= range.start.getTime() && at < range.end.getTime())) {
+      return res.status(403).json({ error: 'ఈరోజు నమోదైన వాటిని మాత్రమే తొలగించవచ్చు' });
+    }
+    const { error: e2 } = await db().from('transactions').delete().eq('id', tx.id).eq('shop_id', req.shop.id);
+    if (e2) throw e2;
+    res.json({ ok: true, id: tx.id });
+  } catch (e) { fail(res, e, 'transactions/delete'); }
+});
+
 // date interpreted in Asia/Kolkata (UTC+5:30)
 const istOffsetMs = (5 * 60 + 30) * 60 * 1000;
 const istToday = () => new Date(Date.now() + istOffsetMs).toISOString().slice(0, 10);
-app.get('/api/transactions', async (req, res) => {
-  let date = typeof req.query.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(req.query.date) ? req.query.date : istToday();
-  const [y, m, d] = date.split('-').map(Number);
+// IST day boundaries (UTC) for YYYY-MM-DD, or null when the date is invalid
+function istDayRange(date) {
+  const [y, m, d] = String(date).split('-').map(Number);
   const probe = new Date(Date.UTC(y, m - 1, d));
-  if (probe.getUTCFullYear() !== y || probe.getUTCMonth() !== m - 1 || probe.getUTCDate() !== d) {
-    return res.status(400).json({ error: 'తేదీ సరిలేదు (YYYY-MM-DD)' });
+  if (probe.getUTCFullYear() !== y || probe.getUTCMonth() !== m - 1 || probe.getUTCDate() !== d) return null;
+  const start = new Date(probe.getTime() - istOffsetMs);           // IST midnight -> UTC
+  return { start, end: new Date(start.getTime() + 24 * 60 * 60 * 1000) };
+}
+
+app.get('/api/transactions', async (req, res) => {
+  // ?recent=N -> the shop's last N entries across all days (Home screen)
+  if (req.query.recent !== undefined) {
+    const n = parseInt(String(req.query.recent), 10);
+    if (!Number.isInteger(n) || n < 1 || n > 50) return res.status(400).json({ error: 'recent 1-50 మధ్య ఉండాలి' });
+    try {
+      const [t, c] = await Promise.all([
+        db().from('transactions').select('id, customer_id, type, amount, raw_transcript, created_at')
+          .eq('shop_id', req.shop.id).order('created_at', { ascending: false }).limit(n),
+        db().from('customers').select('id, name').eq('shop_id', req.shop.id),
+      ]);
+      if (t.error) throw t.error;
+      if (c.error) throw c.error;
+      const names = new Map((c.data || []).map(x => [x.id, x.name]));
+      return res.json({ transactions: (t.data || []).map(x => ({ ...x, customer_name: names.get(x.customer_id) || null })) });
+    } catch (e) { return fail(res, e, 'transactions/recent'); }
   }
-  const start = new Date(probe.getTime() - istOffsetMs);      // IST midnight -> UTC
-  const end = new Date(start.getTime() + 24 * 60 * 60 * 1000);
+  let date = typeof req.query.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(req.query.date) ? req.query.date : istToday();
+  const range = istDayRange(date);
+  if (!range) return res.status(400).json({ error: 'తేదీ సరిలేదు (YYYY-MM-DD)' });
+  const { start, end } = range;
   try {
     const [t, c] = await Promise.all([
       db().from('transactions').select('id, customer_id, type, amount, raw_transcript, created_at')
