@@ -319,6 +319,9 @@ app.post('/api/auth/login', loginLimiter, async (req, res) => {
 
 app.post('/api/auth/logout', (req, res) => { clearSession(res); res.json({ ok: true }); });
 
+// ---- health probe (Render): no auth, returns a constant only — no secrets ----
+app.get('/healthz', (req, res) => res.json({ ok: true }));
+
 // ---- requireAuth: every /api route except /api/auth/* ----
 function requireAuth(req, res, next) {
   const token = req.signedCookies && req.signedCookies.session;

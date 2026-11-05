@@ -30,6 +30,32 @@ Hardening pass over the Phase B app — details in [`SECURITY-HARDENING.md`](SEC
 
 Optional `.env`: `APP_ORIGIN` (extra allowed origins), `TRUST_PROXY=1` (only behind a trusted reverse proxy).
 
+## Deploy on Render (free Web Service)
+
+- **Build command:** `npm install`  **Start command:** `npm start`  (server listens on `process.env.PORT`, so no port config needed)
+- **Runtime:** Node >= 20 (see `engines` in `package.json`; Render's Node image is fine)
+- **Health check path:** `/healthz` (plain GET, returns `{"ok":true}` — no auth, exposes no secrets)
+
+### Environment variables to set in the Render dashboard
+
+| Variable | Value | Notes |
+|---|---|---|
+| `NODE_ENV` | `production` | enables HSTS, secure cookies, hard JWT-secret validation |
+| `TRUST_PROXY` | `1` | one Render proxy hop — rate limits then key on the real client IP |
+| `APP_ORIGIN` | `https://<my-service>.onrender.com` | your Render URL (replace `<my-service>`); CSRF Origin allowlist |
+| `GNANI_API_KEY` | *(your Gnani key — keep secret)* | STT + TTS; stored on the server only, never sent to the browser |
+| `STT_LANG` | `indic-auto` | speech-recognition language |
+| `TTS_VOICE` | `Nalini` | voice used for the challenge words |
+| `TTS_LANG` | `te-IN` | TTS language |
+| `TTS_MODEL` | `timbre-v2.5` | TTS model |
+| `SUPABASE_URL` | *(your project URL)* | Supabase REST endpoint |
+| `SUPABASE_SERVICE_KEY` | *(service-role key — keep secret)* | server-side only; `SUPABASE_SECRET_KEY` is also accepted |
+| `JWT_SECRET` | *(random 32+ chars, 12+ distinct)* | never reuse the dev value; session-cookie signing |
+
+The `data/tts-cache` directory is created automatically at startup (`mkdirSync`, recursive), so a fresh Render disk works with no manual steps. Free-tier disks are ephemeral — the cache just regenerates on redeploy (one Gnani call per unique word).
+
+Never commit `.env`; all secrets go in the Render env-var list above.
+
 ## Phase B (what's in here)
 - **Backend** (all `requireAuth`, every id re-checked against the session shop):
   `PATCH /api/customers/:id`, `POST /api/customers/merge`, `GET /api/customers/:id/transactions`,
