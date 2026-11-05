@@ -7,7 +7,7 @@ const NUMWORDS = [
   // Telugu
   [/^ఒక(టి)?$/, 1], [/^రెండు$/, 2], [/^మూడు$/, 3], [/^నాలుగు$/, 4], [/^ఐదు$/, 5],
   [/^ఆరు$/, 6], [/^ఏడు$/, 7], [/^ఎనిమిది$/, 8], [/^తొమ్మిది$/, 9], [/^పది$/, 10],
-  [/^ఇరవై$/, 20], [/^ముప్పై$/, 30], [/^యాభై$/, 50], [/^వంద(లు)?$/, 100], [/^(వెయ్యి|వేల(ు)?)$/, 1000],
+  [/^ఇరవై$/, 20], [/^ముప్పై$/, 30], [/^యాభై$/, 50], [/^వంద(లు|ల|ా)?$/, 100], [/^(వెయ్యి|వేల(ు)?)$/, 1000],
   // Hindi
   [/^एक$/, 1], [/^दो$/, 2], [/^तीन$/, 3], [/^चार$/, 4], [/^(पाँच|पांच)$/, 5],
   [/^छह$/, 6], [/^सात$/, 7], [/^आठ$/, 8], [/^नौ$/, 9], [/^दस$/, 10],
@@ -31,38 +31,81 @@ function numval(tok) {
   return null;
 }
 
+// fused Telugu number compounds: "ఐదువందలు" -> "ఐదు వందలు", "రెండువేలు" -> "రెండు వేలు".
+// Applied token-wise when the utterance has no digits, before amount extraction.
+const FUSED_SUFFIXES = ['వందలు', 'వందల', 'వేలు'];
+function splitFusedNumbers(t) {
+  return t.split(/\s+/).filter(Boolean).map(tok => {
+    for (const suf of FUSED_SUFFIXES) {
+      if (tok.length > suf.length && tok.endsWith(suf)) return tok.slice(0, tok.length - suf.length) + ' ' + suf;
+    }
+    return tok;
+  }).join(' ');
+}
+
+// Compose a spoken amount from a run of consecutive number words:
+//   5 100        -> 500   ("ఐదు వందలు" / "पाँच सौ" / "five hundred")
+//   2 1000 5 100 -> 2500  ("రెండు వేల ఐదు వందలు" — thousands part + hundreds part)
+//   5 100 50     -> 550   ("ఐదు వందల యాభై" — a tens/ones word directly following is added)
+function runAmount(run) {
+  let total = 0, small = 0, hasSmall = false;
+  for (const { val } of run) {
+    if (val === 100 || val === 1000) {
+      total += (hasSmall ? small : 1) * val;
+      small = 0; hasSmall = false;
+    } else {
+      small += val; hasSmall = true;
+    }
+  }
+  if (hasSmall) total += small;
+  return { amount: total, used: run.map(v => v.tok) };
+}
+
 // Extract an amount from number words ONLY when no digit is present in the text.
-// Returns { amount, used:[tokens consumed] }. A digit-word followed by
-// hundred/thousand multiplies (e.g. "ఐదు వందలు"/"पाँच सौ"/"five hundred" = 500).
+// Returns { amount, used:[tokens consumed] }. The first run of number-word
+// tokens in the text is the amount (compose multiples/remainders via runAmount).
 function amountFromWords(t) {
   const toks = t.split(/[\s.,?!।]+/).filter(Boolean);
   const vals = toks.map(tok => ({ tok, val: numval(tok) }));
   for (let i = 0; i < vals.length; i++) {
-    const a = vals[i];
-    if (!a || a.val == null || a.val >= 100) continue;
-    const b = vals[i + 1];
-    if (b && b.val != null && (b.val === 100 || b.val === 1000)) {
-      return { amount: a.val * b.val, used: [a.tok, b.tok] };
-    }
+    if (vals[i].val == null) continue;
+    let j = i;
+    while (j < vals.length && vals[j].val != null) j++;
+    return runAmount(vals.slice(i, j));
   }
-  const bare = vals.find(v => v && v.val != null);
-  return bare ? { amount: bare.val, used: [bare.tok] } : { amount: null, used: [] };
+  return { amount: null, used: [] };
 }
 
+// Verbs STT tacks onto the sentence ("... appu raayi", "... చేయి"): real words but
+// never part of a customer name. Token-level strip (not a global substring
+// replace) so real names are never cut inside.
+const FILLERS = new Set([
+  'raayi', 'raasuko', 'raayandi', 'rayi', 'chey', 'cheyyi', 'veyyi', 'vesko', 'ivvu', 'ivvandi', 'mariyu',
+  'రాయి', 'రాసుకో', 'రాయండి', 'చేయి', 'చేయండి', 'వేయి', 'వేసుకో', 'ఇవ్వు', 'ఇవ్వండి', 'మరియు', 'ఇంకా',
+].map(w => w.toLowerCase()));
+
+// NB: for every stem the LONGEST variant must come first — these regexes double
+// as name strippers, and a short alternative would eat the stem and leave its
+// tail ("అప్పుగా" matched as "అప్పు" would leak a stray "గా" into the name).
 function parse(raw) {
   let t = (raw || '').normalize('NFC').replace(/[\u200c\u200d]/g, '');
   t = t.replace(/[౦-౯]/g, c => c.charCodeAt(0) - 0xC66).replace(/[०-९]/g, c => c.charCodeAt(0) - 0x966);
   const QUERY = /(entha|ఎంత|kitna|कितना|how much|balance|బ్యాలెన్స్)/i;
-  const STRONGPAY = /(jama|jamaa|జమ|జమా|जमा|paid|kattaru|kattindi|కట్టా|चुका)/i;
-  const CREDIT = /(udhaar|udhar|udar|udhaari|uddhar|uddera|appu|baaki|baki|ఉద్దెర|అప్పు|బాకీ|బాకి|ఉదార్|ఉధార్|ఉదారు|ఉదార|उदार|उधार्|उधार|बाकी)/i;
-  const WEAKPAY = /(ichindi|ichadu|ichaaru|ఇచ్చింది|ఇచ్చాడు|ఇచ్చారు|diya|दिया)/i;
+  const STRONGPAY = /(chellinchaaru|చెల్లించారు|చెల్లించాడు|చెల్లించింది|కట్టారు|కట్టాడు|జమచేయి|jamaa|జమా|jama|జమ|जमा|paid|payment|kattaru|kattadu|kattindi|కట్టా|కట్టింది|चुका)/i;
+  const CREDIT = /(అప్పుగా|appuga|ఉద్దారు|ఉద్ధారు|ఉద్దారి|ఉద్ధారి|udhaari|uddhaari|uddhar|uddera|bakaaya|bakaya|బకాయి|ఉద్దార్|ఉద్ధార్|ఉద్దరా|ఉద్ధరా|uddaar|uddar|udaar|udhaar|udhar|udar|baaki|baki|appu|అప్పు|బాకీ|బాకి|ఉదారి|ఉదారు|ఉదార్|ఉధార్|ఉదార|ఉద్దెర|credit|उदार|उधार्|उधार|बाकी)/i;
+  const WEAKPAY = /(ichindi|ichadu|ichaaru|icharu|ichhaaru|ఇచ్చింది|ఇచ్చాడు|ఇచ్చారు|ఇచ్చెను|diya|दिया)/i;
 
-  // Amount: prefer literal digits; fall back to number words (and remember the
-  // word tokens used so we can strip them out of the name).
-  let amount = null, usedNums = [];
-  const m = t.match(/\d[\d,]*/);
-  if (m) amount = parseInt(m[0].replace(/,/g, ''), 10);
-  else { const w = amountFromWords(t); amount = w.amount; usedNums = w.used; }
+  // Amount: prefer literal digits; fall back to number words (and remember that
+  // we did, so no number-word token leaks into the name).
+  let amount = null, wordPath = false;
+  const dm = t.match(/\d[\d,]*/);
+  if (dm) amount = parseInt(dm[0].replace(/,/g, ''), 10);
+  else {
+    t = splitFusedNumbers(t); // "ఐదువందలు" -> "ఐదు వందలు" before composing
+    const w = amountFromWords(t);
+    amount = w.amount;
+    wordPath = true;
+  }
 
   let type = null;
   if (QUERY.test(t) && !STRONGPAY.test(t)) type = 'query';
@@ -70,12 +113,13 @@ function parse(raw) {
   else if (CREDIT.test(t)) type = 'credit';
   else if (WEAKPAY.test(t)) type = 'pay';
 
-  // Name: drop digits, any number-word tokens we consumed, keywords, stopwords.
+  // Name: drop digits, any number-word tokens (when the amount came from words),
+  // keywords, stopwords, filler verbs.
   let name = t.replace(/\d[\d,]*/g, ' ');
-  if (usedNums.length) {
-    const set = new Set(usedNums);
+  if (wordPath) {
+    // multiplier words beyond the consumed run can never belong in a name
     name = name.split(/\s+/).filter(Boolean)
-      .filter(w => !set.has(w.replace(/^[.,?!।]+|[.,?!।]+$/g, '')))
+      .filter(w => numval(w.replace(/^[.,?!।]+|[.,?!।]+$/g, '')) == null)
       .join(' ');
   }
   name = name
@@ -83,7 +127,19 @@ function parse(raw) {
     .replace(/\b(ki|ko|ku|rupees?|rs|rupayalu|rupaye|ra|garu)\b/gi, ' ')
     .replace(/(రూపాయలు|రూపాయల|రూ|రూపాయి|रुपये|को|की)/g, ' ')
     .replace(/[.,?!।]/g, ' ').replace(/\s+/g, ' ').trim();
-  name = name.split(' ').map(w => w.replace(/(గారికి|కి|కు)$/, '')).join(' ').trim();
+  name = name.split(/\s+/).filter(Boolean).filter(w => !FILLERS.has(w.toLowerCase())).join(' ');
+  name = name.split(' ').filter(Boolean).map(w => w.replace(/(గారికి|కి|కు)$/, '')).join(' ').replace(/\s+/g, ' ').trim();
   return { type, amount, name, raw };
 }
-if (typeof module !== 'undefined') module.exports = parse;
+
+// Second entry point: what parse heard + which fields are missing, so the UI can
+// ask ONE targeted follow-up question instead of guessing a missing field.
+function diagnose(raw) {
+  const p = parse(raw);
+  const missing = [];
+  if (!p.type) missing.push('type');
+  if (!p.amount) missing.push('amount');
+  if (!p.name) missing.push('name');
+  return { type: p.type, amount: p.amount, name: p.name, missing };
+}
+if (typeof module !== 'undefined') { module.exports = parse; module.exports.diagnose = diagnose; }

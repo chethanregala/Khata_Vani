@@ -370,6 +370,19 @@ async function viewProfile() {
 
 // ================= small UI helpers =================
 function say(msg) { const el = $('#say'); if (el) el.textContent = String(msg == null ? '' : msg); }
+// persistent "what I heard" line under the mic: shows the last transcript until
+// the next main-mic recording starts. Separate element -> say()/speak() later
+// messages can never overwrite it.
+function showHeard(raw) {
+  const el = $('#heard');
+  if (!el) return;
+  el.textContent = 'నేను విన్నది · I heard: ' + String(raw == null ? '' : raw);
+  el.hidden = false;
+}
+function hideHeard() {
+  const el = $('#heard');
+  if (el) { el.hidden = true; el.textContent = ''; }
+}
 function clearFlow() { pending = null; const p = $('#panel'); if (p) p.innerHTML = ''; }
 function setRecUI(on) {
   document.body.classList.toggle('recording', on);
@@ -516,6 +529,7 @@ async function toggleMic() {
   if (activeRec) { activeRec.stop(); return; }   // the awaiting call below finishes the job
   if (micBusy) return;
   micBusy = true;
+  hideHeard();          // a new recording replaces the heard line
   clearFlow();
   say('వింటున్నాను… · listening…');
   setRecUI(true);
@@ -572,13 +586,157 @@ function classifyQuery(raw) {
   if (p.type === 'query' && p.name) return { kind: 'name', name: p.name };
   return null;
 }
+
+// ================= guided recovery (one missing field at a time) =================
+// Never guesses: when the parser got exactly one field wrong/missing, the user is
+// asked for THAT field (tap or voice), then the normal entry flow takes over.
+function guidedRecovery(raw) {
+  let d = null;
+  try { d = diagnose(raw); } catch (_) {} // parser.js must be loaded; degrade politely
+  if (!d) return askUnknown(raw);
+  const entry = { type: d.type || null, amount: d.amount || null, name: d.name || null, raw };
+  if (!d.missing.length) return startEntryFlow(entry); // parse is complete — nothing to recover
+  if (d.missing.length > 1) return askUnknown(raw);    // too little to work with — ask for a fresh sentence
+  if (!entry.type) return askMissingType(entry);
+  if (!entry.name) return askMissingName(entry);
+  return askMissingAmount(entry);
+}
+// after a missing field is supplied, continue (possibly asking for the next one)
+function continuePartial() {
+  const p = pending;
+  if (!p || p.kind !== 'partial') return;
+  const e = p.entry;
+  if (!e.type) return askMissingType(e);
+  if (!e.name) return askMissingName(e);
+  if (!e.amount) return askMissingAmount(e);
+  return startEntryFlow(e);
+}
+
+function askMissingType(entry) {
+  pending = { kind: 'partial', entry };
+  const el = $('#panel'); if (!el) return;
+  el.innerHTML = `
+  <div class="card">
+    <div class="q-title">${esc(entry.name)}${entry.amount != null ? ', ' + esc(fmtINR(entry.amount)) : ''}</div>
+    <p class="q-sub">ఉద్దెరా? జమా? · Credit or payment?</p>
+    <div class="type-choice">
+      <button id="tCredit" class="btn primary" type="button">ఉద్దెర<br><small>Credit</small></button>
+      <button id="tPay" class="btn" type="button">జమ<br><small>Payment</small></button>
+    </div>
+    <button id="tMic" class="btn voice" type="button">🎤 మాటతో చెప్పండి · Say "credit" or "payment"</button>
+  </div>`;
+  $('#tCredit').onclick = () => { pending.entry.type = 'credit'; continuePartial(); };
+  $('#tPay').onclick = () => { pending.entry.type = 'pay'; continuePartial(); };
+  $('#tMic').onclick = pickTypeByVoice;
+  speak('ఉద్దెరా, జమా?');
+}
+
+function askMissingName(entry) {
+  if (!state.customers.length) return askNewCustomer(entry); // nobody yet -> it IS new
+  // chooser sheet with every customer + the mic ("say the number") — no alias is
+  // memorised from this transcript because we never heard a usable name
+  openChooser(state.customers, '', 'entry', entry);
+}
+
+function askMissingAmount(entry) {
+  pending = { kind: 'partial', entry };
+  const el = $('#panel'); if (!el) return;
+  el.innerHTML = `
+  <div class="card">
+    <div class="q-title">${esc(entry.name)} — ఎంత?</div>
+    <p class="q-sub">మొత్తం · How much?</p>
+    <input id="amtIn" class="input" type="number" inputmode="numeric" min="1" placeholder="500">
+    <div id="amtErr" class="err" hidden></div>
+    <div class="type-choice">
+      <button id="amtOk" class="btn primary" type="button">కొనసాగించు</button>
+      <button id="amtMic" class="btn" type="button">🎤 చెప్పండి</button>
+    </div>
+  </div>`;
+  $('#amtOk').onclick = () => {
+    const amt = Math.round(Number($('#amtIn').value));
+    if (!Number.isInteger(amt) || amt <= 0) return showErr($('#amtErr'), 'మొత్తం 0 కంటే ఎక్కువ ఉండాలి');
+    pending.entry.amount = amt;
+    continuePartial();
+  };
+  $('#amtMic').onclick = pickAmountByVoice;
+  speak(`${entry.name}, ఎంత?`);
+}
+
+function askUnknown(raw) {
+  say(raw);
+  const el = $('#panel'); if (!el) return;
+  el.innerHTML = `
+  <div class="card">
+    <div class="q-title">అర్థం కాలేదు · Didn't understand</div>
+    <div class="heard in-card">నేను విన్నది · I heard: ${esc(raw)}</div>
+    <p class="q-sub">ఇలా చెప్పండి · Try like this:</p>
+    <ul class="examples">
+      <li>"రమేష్ కి 500 ఉద్దెర" — Credit ₹500 to Ramesh</li>
+      <li>"లక్ష్మి 200 జమ" — Laxmi paid ₹200</li>
+      <li>"రమేష్ కి ఎంత బాకీ" — How much does Ramesh owe</li>
+    </ul>
+  </div>`;
+  speak('అర్థం కాలేదు, మళ్లీ చెప్పండి. ఉదాహరణలు తెరపై చూడండి.');
+}
+
+// spoken "credit"/"payment" for the type question
+async function pickTypeByVoice() {
+  if (activeRec || micBusy) return;
+  const btn = $('#tMic');
+  if (btn) { btn.disabled = true; btn.textContent = '… వింటున్నాను'; }
+  micBusy = true;
+  try {
+    const r = await startRecording();
+    const t = await r.done;
+    if (!pending || pending.kind !== 'partial') return;
+    const p = parse(t);
+    if (p.type === 'credit' || p.type === 'pay') {
+      pending.entry.type = p.type;
+      return continuePartial();
+    }
+    say(t);
+    speak('సరిలేదు, ఉద్దెర లేదా జమ అని చెప్పండి.');
+  } catch (e) { speak(e.message || 'సమస్య జరిగింది'); }
+  finally {
+    micBusy = false;
+    const b = $('#tMic');
+    if (b) { b.disabled = false; b.textContent = '🎤 మాటతో చెప్పండి · Say "credit" or "payment"'; }
+  }
+}
+
+// spoken amount for the amount question (digits or Telugu number words)
+async function pickAmountByVoice() {
+  if (activeRec || micBusy) return;
+  const btn = $('#amtMic');
+  if (btn) { btn.disabled = true; btn.textContent = '…'; }
+  micBusy = true;
+  try {
+    const r = await startRecording();
+    const t = await r.done;
+    if (!pending || pending.kind !== 'partial') return;
+    const p = parse(t);
+    if (Number.isInteger(p.amount) && p.amount > 0) {
+      pending.entry.amount = p.amount;
+      return continuePartial();
+    }
+    say(t);
+    speak('సరిలేదు, మొత్తం మళ్లీ చెప్పండి.');
+  } catch (e) { speak(e.message || 'సమస్య జరిగింది'); }
+  finally {
+    micBusy = false;
+    const b = $('#amtMic');
+    if (b) { b.disabled = false; b.textContent = '🎤 చెప్పండి'; }
+  }
+}
+
 async function handleTranscript(raw) {
   say(raw);
+  showHeard(raw);
   await ensureCustomers();
   const q = classifyQuery(raw);
   if (q) return runQuery(q, raw);
   const entries = buildEntries(splitTranscript(raw));
-  if (!entries.length) return speak('అర్థం కాలేదు, మళ్లీ చెప్పండి.');
+  if (!entries.length) return guidedRecovery(raw);
   if (entries.length === 1) return startEntryFlow(entries[0]);
   return startBatchFlow(entries);
 }
@@ -1036,6 +1194,7 @@ async function viewHome() {
       <span class="ring r1"></span><span class="ring r2"></span><span class="ring r3"></span>
       <button id="mic" type="button" aria-label="మైక్">🎤</button>
     </div>
+    <div id="heard" class="heard" hidden></div>
     <div id="say">నొక్కి మాట్లాడండి · Tap and speak</div>
     <div id="panel"></div>
     <h2 class="section">ఇటీవలి నమోదులు · Last 5 entries</h2>
