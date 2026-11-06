@@ -388,6 +388,40 @@ h2.section { font-size: 15px; font-weight: 600; color: var(--muted); margin: 22p
 .tl-main em { font-style: normal; font-size: 13px; color: var(--muted); font-weight: 600; }
 .tl-main small { font-size: 12.5px; color: var(--muted); overflow-wrap: anywhere; }
 
+/* sprint 1: reversals replace deletion */
+.tl-item.is-reversal { border-color: #eadfb9; background: #fdf9ee; }
+.tl-item.reversed .tl-main { text-decoration: line-through; opacity: .6; }
+.tl-item.reversed .tl-dot { background: #cccccc; }
+.rev-note { color: #a11f43; font-weight: 600; text-decoration: none; }
+.rev, .del {
+  min-width: 44px; min-height: 44px; border: 1.5px solid var(--line); border-radius: 12px;
+  background: #fff; font-size: 18px; cursor: pointer; flex: 0 0 44px;
+}
+.rev:active { border-color: #a11f43; background: #ffe3ea; }
+.rev-card { border-color: #a11f43; margin-top: 10px; }
+
+/* two-step save: editable preview */
+.confirm-amount-edit { display: flex; gap: 8px; align-items: flex-end; margin: 8px 0 4px; }
+.confirm-amount-edit .input { flex: 1; min-height: 52px; }
+.confirm-amount-edit .chip-btn { min-height: 52px; white-space: nowrap; }
+.bal-flip {
+  display: flex; flex-direction: column; gap: 2px; margin: 10px 0;
+  padding: 10px 12px; background: var(--green-soft); border-radius: 12px;
+  font-size: 15.5px;
+}
+.bal-flip-row { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+.bal-flip-arrow { color: var(--muted); }
+.advance-note { color: #96500f; font-weight: 700; font-size: 12.5px; }
+.warn-note {
+  margin: 8px 0; padding: 10px 12px; border-radius: 12px;
+  background: #fff3f0; color: #a11f43; font-weight: 600; font-size: 14px;
+}
+.missing-note {
+  margin: 8px 0; padding: 10px 12px; border-radius: 12px;
+  background: #fff8e6; color: #96500f; font-weight: 600; font-size: 14px;
+}
+.card .btn:disabled { opacity: .5; cursor: not-allowed; }
+
 /* ---------- empty states + skeletons ---------- */
 .empty { text-align: center; padding: 26px 16px; color: var(--muted); }
 .empty-ic { font-size: 40px; display: block; margin-bottom: 8px; }

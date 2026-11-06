@@ -9,6 +9,10 @@ const fs = require('fs');
 const path = require('path');
 const { createClient } = require('@supabase/supabase-js');
 const { requestId, securityHeaders, sameOrigin, contentLength, errorHandler, validateJwtSecret } = require('./security.js');
+const money = require('./lib/money');
+const ledger = require('./lib/ledger');
+const parseVoice = require('./public/parser');     // rule-based parse() (+ parseVoice.diagnose)
+const resolveName = require('./public/resolver');  // name matcher, shared with the browser
 
 const app = express();
 const B = 'https://api.vachana.ai', K = process.env.GNANI_API_KEY;
@@ -40,6 +44,25 @@ const db = () => {
   if (!sb) { const e = new Error('supabase not configured'); e.code = 'NO_SUPA'; throw e; }
   return sb;
 };
+// the ledger module talks to Supabase through this single injected client
+ledger.setClient(sb);
+
+// shared LedgerError/MoneyError responder: machine code -> status, Telugu message
+// to the caller, only the category to the server log (never amounts/names/phones)
+function ledgerFail(res, e, ctx) {
+  if (e && e.code === 'NO_SUPA') return res.status(503).json({ error: 'డేటాబేస్ అమరిక లేదు, యజమానిని సంప్రదించండి' });
+  const status = {
+    OVERPAYMENT: 409, ALREADY_REVERSED: 409, CONFLICT: 409,
+    NOT_FOUND: 404, NOT_OWNED: 404,
+    NOT_REVERSIBLE: 400, BAD_REQUEST: 400, NO_LEDGER: 500,
+  }[(e && e.code)] || 0;
+  if (status === 500) {
+    const rid = (res.locals && res.locals.reqId) || '-';
+    console.error('[ledger-fail] ' + ctx + ' id=' + rid + ' err=' + ((e && (e.code || e.name)) || 'ERROR'));
+    return res.status(500).json({ error: 'సర్వర్ సమస్య, మళ్లీ ప్రయత్నించండి' });
+  }
+  return res.status(status || 500).json({ error: e.message, code: e.code });
+}
 // shared error responder: Telugu message to the caller, only a non-sensitive
 // error category + route + request id to the server log (never message bodies,
 // PII, transcripts or upstream payloads)
@@ -487,27 +510,133 @@ app.post('/api/customers', async (req, res) => {
   } catch (e) { fail(res, e, 'customers/post'); }
 });
 
+// ---- two-step voice save, step 2: the actual post (idempotent) ----
+// The client first previews via POST /api/voice/propose (this route writes
+// nothing) and then confirms here with the idempotency key from the preview.
+// Retrying the same key can never create a second row (shop_id+key unique).
 app.post('/api/transactions', async (req, res) => {
   const b = req.body || {};
-  const customerId = String(b.customer_id || '');
-  const type = b.type;
-  const amount = Number(b.amount);
-  const raw = b.raw_transcript != null ? String(b.raw_transcript).slice(0, 2000) : null;
-  if (!customerId) return res.status(400).json({ error: 'కస్టమర్‌ని ఎంచుకోండి' });
-  if (type !== 'credit' && type !== 'pay') return res.status(400).json({ error: 'రకం credit లేదా pay మాత్రమే' });
-  if (!Number.isInteger(amount) || amount <= 0) return res.status(400).json({ error: 'మొత్తం 0 కంటే ఎక్కువ ఉండాలి' });
   try {
-    // customer must belong to THIS shop (session id, never the body)
-    const own = await db().from('customers').select('id').eq('id', customerId).eq('shop_id', req.shop.id).limit(1);
-    if (own.error) throw own.error;
-    if (!own.data || !own.data.length) return res.status(404).json({ error: 'కస్టమర్ దొరకలేదు' });
-    const { data, error } = await db().from('transactions').insert({
-      shop_id: req.shop.id, customer_id: customerId, type, amount, raw_transcript: raw,
-      created_at: new Date().toISOString(),
-    }).select('id, customer_id, type, amount, raw_transcript, created_at').single();
-    if (error) throw error;
-    res.status(201).json(data);
-  } catch (e) { fail(res, e, 'transactions/post'); }
+    const row = {
+      customer_id: b.customer_id, type: b.type, amount: b.amount,
+      workflow: b.workflow === 'rythu' || b.workflow === 'dairy' ? b.workflow : 'kirana',
+      direction: b.direction === 'payable' ? 'payable' : 'receivable',
+      note: b.note, produce: b.produce, deduction_category: b.deduction_category,
+      quantity: b.quantity, rate: b.rate, unit: b.unit, rate_unit: b.rate_unit,
+      raw_transcript: b.raw_transcript,
+      // the preview's key keeps confirm/retry consistent; a missing key still
+      // gets one so a disconnected double-tap can never double-post
+      idempotency_key: typeof b.idempotency_key === 'string' && b.idempotency_key
+        ? b.idempotency_key : crypto.randomUUID(),
+      source: b.source === 'screen' ? 'screen' : 'voice',
+    };
+    const out = await ledger.postTransactions(req.shop.id, [row]);
+    const posted = out && out[0];
+    if (!posted) throw Object.assign(new Error('no row'), { code: 'LEDGER_RPC' });
+    res.status(201).json({ ...posted, dedup: !!posted.dedup });
+  } catch (e) { ledgerFail(res, e, 'transactions/post'); }
+});
+
+// ---- reverse: undo a mistake with ONE offsetting row (never a hard delete) ----
+app.post('/api/transactions/:id/reverse', async (req, res) => {
+  const reason = String((req.body || {}).reason == null ? '' : (req.body || {}).reason).trim();
+  if (!reason) return res.status(400).json({ error: 'రద్దు కారణం తప్పనిసరి · reason required' });
+  try {
+    const r = await ledger.reverseTransaction(req.shop.id, String(req.params.id), reason);
+    res.json(r);
+  } catch (e) { ledgerFail(res, e, 'transactions/reverse'); }
+});
+
+// ---- propose: creates NOTHING. Preview the parsed candidate, missing fields,
+// balance before/after and the confirm idempotency key — then the client POSTs
+// /api/transactions with that key to actually save. Editable transcript is
+// re-proposed (debounced) by the client; each propose may mint a fresh key.
+// separators: ",", " and ", " aur ", " mariyu ", "మరియు", "ఔరు", "తరువాత"
+// (comma must be followed by whitespace so "1,000" stays one amount)
+function splitTranscript(raw) {
+  const SEP = /\s*,\s+|,\s*$|\s+and\s+|\s+aur\s+|\s+mariyu\s+|\s+మరియు\s+|\s+ఔరు?\s+|\s+తరువాత\s+/gi;
+  return String(raw || '').split(SEP).map(s => s.trim()).filter(Boolean);
+}
+// later parts inherit only type/name context from the previous part;
+// the amount always comes from the part itself (never copied)
+function buildEntries(parts) {
+  const out = [];
+  let prev = null;
+  for (const part of parts) {
+    let parsed;
+    try { parsed = parseVoice(part); } catch (_) { continue; }
+    const type = parsed.type === 'query' ? null : parsed.type;
+    const name = parsed.name || (prev && prev.name);
+    const entryType = type || (prev && prev.type);
+    const amount = parsed.amount;
+    if (!amount || !entryType || !name) continue;
+    const e = { type: entryType, amount, name, raw: part };
+    out.push(e); prev = e;
+  }
+  return out;
+}
+app.post('/api/voice/propose', async (req, res) => {
+  const b = req.body || {};
+  if (typeof b.transcript !== 'string' || !b.transcript.trim()) {
+    return res.status(400).json({ error: 'మాట లేదు · transcript required' });
+  }
+  if (b.transcript.length > 2000) {
+    return res.status(400).json({ error: 'వాక్యం చాలా పొడవుగా ఉంది · sentence too long' });
+  }
+  try {
+    const customers = await db().from('customers')
+      .select('id, name, label, phone, aliases').eq('shop_id', req.shop.id);
+    if (customers.error) throw customers.error;
+    const roster = customers.data || [];
+    const parts = splitTranscript(b.transcript).slice(0, 10);
+    const parsed = buildEntries(parts);
+    if (!parsed.length) {
+      return res.json({
+        candidate: [], missingFields: ['TRANSCRIPT'], ambiguities: [],
+        previewText: '', balanceBefore: 0, balanceAfter: 0,
+      });
+    }
+    const entries = parsed.map(e => {
+      const key = crypto.randomUUID();
+      let status = 'none', candidates = [], customerId = null;
+      const m = resolveName(e.name, roster);
+      status = m.status; candidates = (m.candidates || []).slice(0, 5).map(x => ({ id: x.id, name: x.name }));
+      if (status === 'one' && candidates[0]) customerId = candidates[0].id;
+      // (an ambiguous/unresolved name reads as a missing field; the client's
+      // chooser or new-customer flow resolves it, the save enforces ownership)
+      const missing = [];
+      if (!customerId) missing.push(status === 'many' || status === 'fuzzy' ? 'CUSTOMER_AMBIGUOUS' : 'CUSTOMER_UNKNOWN');
+      if (e.amount == null) missing.push('AMOUNT'); // parser always fills; defensive
+      return {
+        type: e.type, amount: e.amount, name: e.name, transcript: e.raw,
+        customer_id: customerId, status, candidates,
+        idempotency_key: key, missing, warnings: [], dedup: false,
+      };
+    });
+    const missingFields = [...new Set(entries.flatMap(x => x.missing))];
+    const ambiguities = entries
+      .filter(x => x.status === 'many' || x.status === 'fuzzy' || x.status === 'none')
+      .map(x => ({ name: x.name, status: x.status, options: x.candidates }));
+
+    // balance for the customer this batch touches (first matched entry wins)
+    const focus = entries.find(x => x.customer_id);
+    let balanceBefore = 0;
+    if (focus) {
+      const bal = await ledger.balance(focus.customer_id, 'receivable');
+      balanceBefore = bal.rupees;
+    }
+    const previewText = entries
+      .map(e => `${e.name} ₹${String(e.amount)} ${e.type === 'credit' ? 'ఉద్దెర' : 'జమ'}`)
+      .join(' · ');
+    // kirana overpayment forewarning: the save itself will hard-reject with 409
+    if (focus && entries.length === 1 && entries[0].type === 'pay' && Number(entries[0].amount) > Number(balanceBefore)) {
+      entries[0].warnings.push('OVERPAYMENT');
+    }
+    res.json({
+      candidate: entries, missingFields, ambiguities, previewText,
+      balanceBefore, balanceAfter: balanceBefore, // recomputed client-side per edit
+    });
+  } catch (e) { fail(res, e, 'voice/propose'); }
 });
 
 // ---- customer helpers: every id from the client is re-checked against THIS shop ----
@@ -600,7 +729,7 @@ app.get('/api/customers/:id/transactions', async (req, res) => {
     const c = await ownCustomer(req, req.params.id);
     if (!c) return res.status(404).json({ error: 'కస్టమర్ దొరకలేదు' });
     const { data, error } = await db().from('transactions')
-      .select('id, customer_id, type, amount, raw_transcript, created_at')
+      .select('id, customer_id, type, amount, raw_transcript, created_at, event, workflow, direction, status, reverses_id, reason')
       .eq('shop_id', req.shop.id).eq('customer_id', c.id)
       .order('created_at', { ascending: false });
     if (error) throw error;
@@ -608,23 +737,15 @@ app.get('/api/customers/:id/transactions', async (req, res) => {
   } catch (e) { fail(res, e, 'customers/tx'); }
 });
 
-// DELETE /api/transactions/:id — undo a mistake: only entries created today (IST)
-app.delete('/api/transactions/:id', async (req, res) => {
-  try {
-    const { data, error } = await db().from('transactions').select('id, created_at')
-      .eq('id', String(req.params.id)).eq('shop_id', req.shop.id).limit(1);
-    if (error) throw error;
-    const tx = data && data[0];
-    if (!tx) return res.status(404).json({ error: 'నమోదు దొరకలేదు' });
-    const range = istDayRange(istToday());
-    const at = new Date(tx.created_at).getTime();
-    if (!(at >= range.start.getTime() && at < range.end.getTime())) {
-      return res.status(403).json({ error: 'ఈరోజు నమోదైన వాటిని మాత్రమే తొలగించవచ్చు' });
-    }
-    const { error: e2 } = await db().from('transactions').delete().eq('id', tx.id).eq('shop_id', req.shop.id);
-    if (e2) throw e2;
-    res.json({ ok: true, id: tx.id });
-  } catch (e) { fail(res, e, 'transactions/delete'); }
+// DELETE /api/transactions/:id — RETIRED in sprint 1: ledger rows are financial
+// records and are never hard-deleted. The replacement is
+// POST /api/transactions/:id/reverse { reason }, which writes one offsetting
+// row and marks the original reversed (audit-safe). The old today-IST-only
+// delete would silently vanish history; clients get 410 Gone.
+app.delete('/api/transactions/:id', (req, res) => {
+  res.status(410).json({
+    error: 'నమోదును తొలగించడం ఇప్పుడు లేదు — బదులుగా రద్దు (reverse) వాడండి · entries can no longer be deleted; use reverse',
+  });
 });
 
 // date interpreted in Asia/Kolkata (UTC+5:30)

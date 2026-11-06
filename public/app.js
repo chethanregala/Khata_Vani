@@ -31,6 +31,13 @@ function normalizeName(s) {
 }
 function showErr(el, msg) { if (el) { el.textContent = msg; el.hidden = false; } }
 function hideErr(el) { if (el) { el.textContent = ''; el.hidden = true; } }
+// idempotency key minted in the browser when no server preview supplies one —
+// a retried confirm then reuses the SAME key and can never double-post
+const newKey = () => (self.crypto && crypto.randomUUID)
+  ? crypto.randomUUID()
+  : 'k' + Date.now() + '-' + Math.random().toString(36).slice(2, 10);
+// a negative balance is normal for payable flows: money already settled ahead
+const ADVANCE_TE_EN = 'అడ్వాన్స్ వసూలు చేయాలి · advance to recover';
 function goLogin() {
   state.shop = null; state.customers = []; state.today = []; state.recent = [];
   state.voiceOkToken = null; state.phone = null;
@@ -755,28 +762,132 @@ function typeTe(t) { return t === 'credit' ? 'ఉద్దెర · Credit' : '�
 function amtClass(t) { return t === 'credit' ? 'owed' : 'paid'; }
 
 function askConfirm(entry) {
-  pending = { kind: 'single', entry };
-  const el = $('#panel'); if (!el) return;
-  const c = state.customers.find(x => x.id === entry.customerId);
+  // STEP 1 of the two-step save: this card is only a PREVIEW. POST
+  // /api/voice/propose creates nothing — it returns the parsed candidate,
+  // missing fields, balance before/after and the idempotency key to be used at
+  // the confirm. Editing the transcript re-proposes (debounced, new key);
+  // ✅ posts to /api/transactions with the key and only then says "saved".
+  pending = { kind: 'single', entry, preview: null, ready: false, confirmKey: null, proposeSeq: 0 };
+  renderConfirmCard();
+  runPropose(entry.raw || entry.name);
+  speak(`${entry.name}, ${entry.amount} రూపాయలు ${entry.type === 'credit' ? 'ఉద్దెర' : 'జమ'}. సరిగ్గా ఉందా?`);
+}
+const MISSING_LABELS = {
+  CUSTOMER_UNKNOWN: 'కస్టమర్ పేరు · customer', CUSTOMER_AMBIGUOUS: 'ఖచ్చితమైన పేరు · exact person',
+  AMOUNT: 'మొత్తం · amount', TRANSCRIPT: 'మాట · sentence', TYPE: 'రకం · type',
+};
+// only treat a missing code as blocking when the CLIENT entry cannot already
+// supply it (guided recovery fixes fields by tap; the server transcript
+// re-propose may then still fail to re-parse — that must not brick the save)
+function missingLines(missing, entry) {
+  return (missing || []).filter(code => {
+    if ((code === 'CUSTOMER_UNKNOWN' || code === 'CUSTOMER_AMBIGUOUS') && entry.customerId) return false;
+    if (code === 'AMOUNT' && Number(entry.amount) > 0) return false;
+    if (code === 'TYPE' && (entry.type === 'credit' || entry.type === 'pay')) return false;
+    if (code === 'TRANSCRIPT' && entry.name && Number(entry.amount) > 0 &&
+        (entry.type === 'credit' || entry.type === 'pay')) return false;
+    return true;
+  });
+}
+function renderConfirmCard() {
+  const p = pending, el = $('#panel');
+  if (!p || !el) return;
+  const e = p.entry;
+  const v = p.preview;
+  const c = state.customers.find(x => x.id === e.customerId);
+  const balBefore = v && v.balanceBefore != null ? Number(v.balanceBefore)
+    : (c && typeof c.balance === 'number' ? c.balance : null);
+  const balAfter = balBefore == null ? null : balBefore + (e.type === 'credit' ? Number(e.amount) : -Number(e.amount));
+  const warnings = (v && v.candidate && v.candidate[0] && v.candidate[0].warnings) || [];
+  const missing = missingLines(v && v.missingFields, e);
+  p.ready = !!v && !missing.length;
   el.innerHTML = `
   <div class="card confirm">
     <div class="confirm-head">
-      <span class="avatar av-0">${esc(initialsOf(entry.name))}</span>
-      <span class="confirm-names"><b>${esc(entry.name)}</b><small>${esc((c && c.label) || '')}</small></span>
-      <span class="confirm-amt ${amtClass(entry.type)}">${esc(fmtINR(entry.amount))}</span>
+      <span class="avatar av-0">${esc(initialsOf(e.name))}</span>
+      <span class="confirm-names"><b>${esc(e.name)}</b><small>${esc((c && c.label) || '')}</small></span>
+      <span class="confirm-amt ${amtClass(e.type)}">${esc(fmtINR(e.amount))}</span>
     </div>
-    <span class="type-tag ${entry.type}">${typeTe(entry.type)}</span>
+    <span class="type-tag ${e.type}">${typeTe(e.type)}</span>
+    <div class="confirm-amount-edit">
+      <label class="field" for="cfAmt">మొత్తం · Amount</label>
+      <input id="cfAmt" class="input" type="number" inputmode="numeric" min="1" value="${esc(Number(e.amount) || '')}">
+      <button id="cfType" class="chip-btn" type="button" aria-label="రకం మార్చండి">రకం · ${typeTe(e.type)} (tap to switch)</button>
+    </div>
+    <div class="bal-flip">బ్యాలెన్స్‌లోడవుతోంది…</div>
+    ${warnings.indexOf('OVERPAYMENT') !== -1 ? `
+      <div class="warn-note">జమ మిగిలిన బాకీ కంటే ఎక్కువ అవుతోంది — సేవ్ అయితె తిరస్కరించబడుతుంది · repayment exceeds balance; the save would be rejected</div>` : ''}
+    ${missing.length ? `<div class="missing-note">అవసరం · needed: ${esc(missing.map(m => MISSING_LABELS[m] || m).join(', '))}</div>` : ''}
+    <label class="field" for="cfTx">నేను విన్నది · I heard (editable)</label>
+    <input id="cfTx" class="input" value="${esc(e.raw || '')}">
     <p class="q-sub">సరిగ్గా ఉందా? · Is this right?</p>
     <div class="confirm-actions">
-      <button id="yes" class="btn primary" type="button">✅ అవును</button>
+      <button id="yes" class="btn primary" type="button"${p.ready ? '' : ' disabled'}>✅ అవును</button>
       <button id="no" class="btn ghost" type="button">❌ కాదు</button>
     </div>
     <button id="other" class="link wide" type="button">➕ వేరే వ్యక్తి · Different person?</button>
   </div>`;
-  $('#yes').onclick = onYes;
+  $('#yes').onclick = () => { if (pending && pending.ready) onYes(); };
   $('#no').onclick = onNo;
-  $('#other').onclick = () => askNewCustomer(entry); // a second person with the same name
-  speak(`${entry.name}, ${entry.amount} రూపాయలు ${entry.type === 'credit' ? 'ఉద్దెర' : 'జమ'}. సరిగ్గా ఉందా?`);
+  $('#other').onclick = () => askNewCustomer(e);
+  $('#cfType').onclick = () => { e.type = e.type === 'credit' ? 'pay' : 'credit'; renderConfirmCard(); };
+  const amtIn = $('#cfAmt'), txIn = $('#cfTx'), flip = $('.bal-flip', el);
+  amtIn.addEventListener('input', () => {
+    const a = Math.round(Number(amtIn.value));
+    if (!Number.isInteger(a) || a <= 0) return;
+    e.amount = a;
+    const big = $('.confirm-amt', el);
+    if (big) big.textContent = fmtINR(a);
+    renderBalFlip(flip, e, a, balBefore);
+  });
+  let txTimer = null;
+  txIn.addEventListener('input', () => {
+    e.raw = txIn.value;
+    if (txTimer) clearTimeout(txTimer);
+    txTimer = setTimeout(() => runPropose(txIn.value), 700);
+  });
+  renderBalFlip(flip, e, e.amount, balBefore);
+}
+// balance before → after, shown live as the amount is edited
+function renderBalFlip(flip, e, amount, fixedBefore) {
+  if (!flip) return;
+  let before = fixedBefore;
+  if (before == null) {
+    const c = state.customers.find(x => x.id === e.customerId);
+    before = c && typeof c.balance === 'number' ? c.balance : null;
+  }
+  if (before == null) { flip.textContent = 'బ్యాలెన్స్ లోడ్ అవుతోంది… · loading balance…'; return; }
+  const after = Number(before) + (e.type === 'credit' ? Number(amount) : -Number(amount));
+  flip.innerHTML = `<span class="bal-flip-row">
+    <span>${esc(fmtINR(before))}</span><span class="bal-flip-arrow">→</span>
+    <b class="${after < 0 ? 'paid' : 'owed'}">${esc(fmtINR(after))}</b></span>
+    ${after < 0 ? `<small class="advance-note">${esc(ADVANCE_TE_EN)}</small>` : ''}`;
+}
+// POST /api/voice/propose — step 1: never writes anything. A newer edit cancels
+// an in-flight propose via proposeSeq; the key only becomes valid at confirm.
+async function runPropose(transcript) {
+  const p = pending;
+  if (!p || p.kind !== 'single') return;
+  const seq = ++p.proposeSeq;
+  try {
+    const v = await api('/api/voice/propose', {
+      method: 'POST', body: { transcript: String(transcript || '').trim() || p.entry.name },
+    });
+    if (pending !== p || seq !== p.proposeSeq) return; // superseded by a newer edit
+    p.preview = v;
+    const first = v.candidate && v.candidate[0];
+    if (first && first.idempotency_key) p.confirmKey = first.idempotency_key;
+    if (first && first.customer_id && !p.entry.customerId) p.entry.customerId = first.customer_id;
+    renderConfirmCard();
+  } catch (e) {
+    if (e.status === 401) return goLogin();
+    // preview unavailable (offline etc.): fall back to a locally minted key so
+    // the shopkeeper can still confirm; the save stays idempotent
+    if (pending !== p || seq !== p.proposeSeq) return;
+    p.preview = { candidate: [], missingFields: [], balanceBefore: null };
+    if (!p.confirmKey) p.confirmKey = newKey();
+    renderConfirmCard();
+  }
 }
 
 function askNewCustomer(entry) {
@@ -828,9 +939,17 @@ async function onYes() {
   btns.forEach(b => { b.disabled = true; });
   try {
     if (p.kind === 'single') {
+      // the confirm carries the key minted when the preview was created
+      // (a fallback key exists when the preview call itself failed)
+      p.entry.idempotency_key = p.entry.idempotency_key || p.confirmKey || newKey();
+      const txBox = $('#cfTx');
+      p.entry.raw = (txBox && txBox.value.trim()) || p.entry.raw || p.entry.name;
+      if (!p.entry.customer_id && state.customers.find(x => x.id === p.entry.customerId)) {
+        p.entry.customer_id = p.entry.customerId;
+      }
       await saveEntries([p.entry]);
       clearFlow();
-      return speak('నమోదు చేశాను.');
+      return speak('నమోదు చేశాను. · saved');
     }
     if (p.kind === 'new') {
       const name = ($('#ncName') && $('#ncName').value.trim()) || p.entry.name;
@@ -849,9 +968,10 @@ async function onYes() {
         c = await api('/api/customers', { method: 'POST', body: { name, label, phone: phoneRaw || null } });
         state.customers.push({ ...c, balance: 0, last_activity: null, last_payment_at: null });
       }
-      await saveEntries([{ ...p.entry, customerId: c.id }]);
-      clearFlow();
-      return speak('కొత్త కస్టమర్ చేర్చి, నమోదు చేశాను.');
+      // created → the entry itself still goes through the two-step preview
+      // (propose supplies the idempotency key + balance before/after)
+      btns.forEach(b => { b.disabled = true; });
+      return askConfirm({ ...p.entry, customerId: c.id, raw: p.entry.raw || name });
     }
     if (p.kind === 'fuzzy') {
       await addAlias(p.candidate, p.spoken);
@@ -891,7 +1011,14 @@ async function saveEntries(list) {
     }
     const tx = await api('/api/transactions', {
       method: 'POST',
-      body: { customer_id: c.id, type: e.type, amount: e.amount, raw_transcript: e.raw || e.name },
+      body: {
+        customer_id: c.id, type: e.type, amount: e.amount,
+        raw_transcript: e.raw || (e.customer_id ? '' : e.name),
+        // keys come from the preview when propose made one; batch/screen entries
+        // mint their own, so a dropped connection can never double-post
+        idempotency_key: e.idempotency_key || newKey(),
+        source: e.source || 'voice',
+      },
     });
     saved.push({ entry: e, customer: c, tx });
   }
@@ -916,10 +1043,12 @@ async function addAlias(c, spoken) {
 
 // ================= multi-entry (one sentence, one confirmation) =================
 async function startBatchFlow(entries) {
+  // every batch line gets its own idempotency key NOW (entry-minted); the
+  // confirm then posts exactly those rows — retries reuse the same keys
   const withCust = entries.map(e => {
     const r = resolve(e.name, state.customers);
     const c = r.candidates[0] || null;
-    return { ...e, customerId: c ? c.id : null };
+    return { ...e, customerId: c ? c.id : null, idempotency_key: newKey() };
   });
   pending = { kind: 'batch', entries: withCust };
   renderBatch();
@@ -975,12 +1104,18 @@ function renderResult(o) {
   $('#rclose').onclick = clearFlow;
 }
 async function speakBalance(c) {
-  const msg = c.balance > 0
-    ? `${c.name} బాకీ ${c.balance} రూపాయలు.`
-    : `${c.name} కి బాకీ లేదు.`;
+  const bal = Number(c.balance) || 0;
+  const msg = bal > 0
+    ? `${c.name} బాకీ ${bal} రూపాయలు.`
+    : bal < 0
+      ? `${c.name} ఖాతాలో ${Math.abs(bal)} రూపాయల అడ్వాన్స్ ఉంది.` // advance to recover
+      : `${c.name} కి బాకీ లేదు.`;
   renderResult({
     title: `${c.name} · బాకీ`,
-    rows: [['బాకున్నది · Balance', c.balance]],
+    rows: [['బాకున్నది · Balance', bal < 0 ? 0 : bal]],
+    ...(bal < 0
+      ? { rows: [['అడ్వాన్స్ వసూలు చేయాలి · advance to recover', Math.abs(bal)]] }
+      : {}),
   });
   return speak(msg);
 }
@@ -1278,6 +1413,7 @@ function renderCustomers() {
       </span>
       <span class="cust-right">
         <b class="bal ${c.balance > 0 ? 'owed' : ''}">${esc(fmtINR(c.balance || 0))}</b>
+        ${c.balance < 0 ? `<small class="advance-note">${esc(ADVANCE_TE_EN)}</small>` : ''}
         <button class="remind" type="button" data-remind="${esc(c.id)}" aria-label="రిమైండర్">🔊</button>
       </span>
     </div>`).join('');
@@ -1321,6 +1457,7 @@ async function viewCustomer(id) {
       <div class="detail-bal">
         <small>బాకీ · Balance</small>
         <b class="bal ${c.balance > 0 ? 'owed' : ''}">${esc(fmtINR(c.balance || 0))}</b>
+        ${c.balance < 0 ? `<small class="advance-note">${esc(ADVANCE_TE_EN)}</small>` : ''}
         ${isOverdue(c) ? '<span class="badge overdue">Overdue 30+ days</span>' : ''}
       </div>
     </div>
@@ -1380,7 +1517,15 @@ async function viewCustomer(id) {
     if (!Number.isFinite(amt) || amt <= 0) return showErr($('#payErr'), 'మొత్తం 0 కంటే ఎక్కువ ఉండాలి');
     const b = $('#paySave'); b.disabled = true;
     try {
-      await api('/api/transactions', { method: 'POST', body: { customer_id: c.id, type: 'pay', amount: amt, raw_transcript: 'receive payment (screen)' } });
+      await api('/api/transactions', {
+        method: 'POST',
+        body: {
+          customer_id: c.id, type: 'pay', amount: amt,
+          raw_transcript: 'receive payment (screen)',
+          idempotency_key: newKey(), // screen entries are idempotent too
+          source: 'screen',
+        },
+      });
       $('#payForm').hidden = true;
       $('#payAmt').value = '';
       await refreshHome();
@@ -1444,38 +1589,71 @@ function renderMergeList(c) {
 async function loadTimeline(id) {
   const el = $('#timeline');
   const r = await api('/api/customers/' + id + '/transactions');
+  const closeRevCard = () => { const rc = $('#revCard'); if (rc) rc.remove(); };
   if (!el) return r;
   if (!r.transactions.length) {
     el.innerHTML = emptyState('🧾', 'ఇంకా నమోదులు లేవు', 'No transactions yet');
     return r;
   }
-  const today = istToday();
+  // Reversals replace deletion: an entry is never removed — a ⚖-offsetting row
+  // and a 'reversed' flag preserve an auditable history. Reversal rows
+  // themselves and anything already reversed offer no ⟲ action.
   el.innerHTML = r.transactions.map(t => {
-    const isToday = String(t.created_at).slice(0, 10) === today;
+    const reversed = t.status === 'reversed';
+    const isRev = t.event === 'reversal';
+    const sign = t.type === 'credit' ? '+' : '−';
+    const em = isRev ? 'రద్దు చేసింది · reversal' : (t.type === 'credit' ? 'ఉద్దెర' : 'జమ');
+    const head = isRev
+      ? `↺ ${esc(em)} ${sign === '+' ? '+' : '−'}${esc(fmtINR(t.amount))}`
+      : `${sign}${esc(fmtINR(t.amount))} <em>${esc(em)}</em>`;
     return `
-    <div class="tl-item">
+    <div class="tl-item${reversed ? ' reversed' : ''}${isRev ? ' is-reversal' : ''}">
       <span class="tl-dot ${t.type}"></span>
       <span class="tl-main">
-        <b>${t.type === 'credit' ? '+' : '−'}${esc(fmtINR(t.amount))} <em>${t.type === 'credit' ? 'ఉద్దెర' : 'జమ'}</em></b>
-        <small>${esc(timeOf(t.created_at))}${t.raw_transcript ? ' · “' + esc(String(t.raw_transcript).slice(0, 60)) + '”' : ''}</small>
+        <b>${head}</b>
+        <small>${esc(timeOf(t.created_at))}${!isRev && t.raw_transcript ? ' · “' + esc(String(t.raw_transcript).slice(0, 60)) + '”' : ''}${t.reason ? ' · ' + esc(String(t.reason).slice(0, 80)) : ''}</small>
+        ${reversed ? '<small class="rev-note">రద్దు చేయబడింది · reversed</small>' : ''}
       </span>
-      ${isToday ? `<button class="del" type="button" data-del-tx="${esc(t.id)}" aria-label="రద్దు చేయండి">🗑</button>` : ''}
+      ${(!isRev && !reversed) ? `<button class="rev" type="button" data-rev-tx="${esc(t.id)}" aria-label="రద్దు చేయండి">⟲</button>` : ''}
     </div>`;
   }).join('');
-  el.querySelectorAll('[data-del-tx]').forEach(b => {
-    b.onclick = async () => {
-      if (!confirm('ఈ నమోదును రద్దు చేయాలా? · Undo this entry?')) return;
-      b.disabled = true;
-      try {
-        await api('/api/transactions/' + b.dataset.delTx, { method: 'DELETE' });
-        await refreshHome();
-        await loadTimeline(id);
-        speak('రద్దు చేశాను.');
-      } catch (e) {
-        if (e.status === 401) return goLogin();
-        showErr($('#derr'), e.message);
-        b.disabled = false;
-      }
+  closeRevCard();
+  el.querySelectorAll('[data-rev-tx]').forEach(b => {
+    b.onclick = () => {
+      closeRevCard();
+      const card = document.createElement('div');
+      card.id = 'revCard';
+      card.className = 'card rev-card';
+      card.innerHTML = `
+        <div class="q-title">నమోదును రద్దు చేయండి · Reverse this entry</div>
+        <p class="q-sub">ఒక ఎదురు నమోదు వస్తుంది; మొదటిది రద్దు అవుతుంది · One offsetting entry is posted and the original is marked reversed</p>
+        <label class="field" for="revReason">కారణం · Reason</label>
+        <input id="revReason" class="input" maxlength="200" placeholder="తప్పు మొత్తం · wrong amount">
+        <div class="confirm-actions">
+          <button id="revOk" class="btn primary" type="button">⟲ రద్దు చేయండి</button>
+          <button id="revNo" class="btn ghost" type="button">❌ వదులుకోండి</button>
+        </div>
+        <div id="revErr" class="err" hidden></div>`;
+      el.after(card);
+      $('#revReason').focus();
+      $('#revNo').onclick = closeRevCard;
+      $('#revOk').onclick = async () => {
+        const reason = $('#revReason').value.trim();
+        if (!reason) return showErr($('#revErr'), 'రద్దు కారణం తప్పనిసరి · reason required');
+        const btn = $('#revOk');
+        btn.disabled = true;
+        try {
+          await api('/api/transactions/' + b.dataset.revTx + '/reverse', { method: 'POST', body: { reason } });
+          closeRevCard();
+          await refreshHome();
+          await loadTimeline(id);
+          speak('రద్దు చేశాను. · reversed');
+        } catch (e) {
+          if (e.status === 401) return goLogin();
+          showErr($('#revErr'), e.message);
+          btn.disabled = false;
+        }
+      };
     };
   });
   return r;
