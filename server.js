@@ -58,12 +58,28 @@ function ledgerFail(res, e, ctx) {
     NOT_FOUND: 404, NOT_OWNED: 404,
     NOT_REVERSIBLE: 400, BAD_REQUEST: 400, NO_LEDGER: 500,
   }[(e && e.code)] || 0;
-  if (status === 500) {
+  const final = status || 500; // unmapped -> 500 (and it must still be logged)
+  if (final >= 500) {
     const rid = (res.locals && res.locals.reqId) || '-';
-    console.error('[ledger-fail] ' + ctx + ' id=' + rid + ' err=' + ((e && (e.code || e.name)) || 'ERROR'));
-    return res.status(500).json({ error: 'సర్వర్ సమస్య, మళ్లీ ప్రయత్నించండి' });
+    console.error('[ledger-fail] ' + ctx + ' id=' + rid + ' err=' + ((e && (e.code || e.name)) || 'ERROR') + pgDiag(e));
+    return res.status(final).json({ error: 'సర్వర్ సమస్య, మళ్లీ ప్రయత్నించండి' });
   }
-  return res.status(status || 500).json({ error: e.message, code: e.code });
+  return res.status(final).json({ error: e.message, code: e.code });
+}
+// opaque, PII-free database diagnostics: Postgres/PostgREST error CODE and,
+// when the message names them, the CONSTRAINT or COLUMN identifier only —
+// never the message text itself, which can carry row values / names
+function pgDiag(e) {
+  const p = (e && e.cause) || e;
+  if (!p || typeof p !== 'object') return '';
+  const out = [];
+  if (p.code) out.push('pg=' + String(p.code).slice(0, 12));
+  const msg = String(p.message || '');
+  const con = (msg.match(/constraint "([^"]+)"/) || [])[1];
+  const col = (msg.match(/column "([^"]+)"/) || [])[1];
+  if (con) out.push('constraint=' + con.slice(0, 64));
+  if (col) out.push('column=' + col.slice(0, 64));
+  return out.length ? ' [' + out.join(' ') + ']' : '';
 }
 // shared error responder: Telugu message to the caller, only a non-sensitive
 // error category + route + request id to the server log (never message bodies,
@@ -197,6 +213,28 @@ function wordAudio(word) {
   })().finally(() => inflight.delete(sha1(word)));
   inflight.set(sha1(word), p);
   return p;
+}
+
+// whole-sentence read-through cache: s-<sha1(text)>.wav. Confirm-card and
+// balance sentences repeat a lot across replays/rereads, so a cache hit skips
+// a Gnani call — this is what keeps the upstream 429 rate limits from turning
+// into user-visible 502s. Read-only check before synthesis; the write is
+// best-effort (a failed write only costs the next hit, never breaks playback).
+// The file NAME is a hash; the text or its words are never stored anywhere.
+async function sentenceAudio(text) {
+  const file = path.join(CACHE_DIR, 's-' + sha1(text) + '.wav');
+  if (fs.existsSync(file)) {
+    try { return { ok: true, cached: true, buffer: fs.readFileSync(file) }; } catch (_) {}
+  }
+  const out = await gnaniTts(text);
+  if (out.ok) {
+    try {
+      const tmp = file + '.' + process.pid + '.tmp';
+      fs.writeFileSync(tmp, out.buffer);
+      fs.renameSync(tmp, file);
+    } catch (_) {}
+  }
+  return out;
 }
 
 // ---- Telugu kirana word bank (voice-word check) ----
@@ -457,13 +495,15 @@ app.post('/api/tts', ttsApiLimiter, contentLength(8 * 1024), async (req, res) =>
       error: `టెక్స్ట్ ${TTS_TEXT_MAX} అక్షరాల లోపల ఉండాలి · max ${TTS_TEXT_MAX} characters`,
     });
   }
-  const out = await gnaniTts(b.text.trim());
+  // read-through sentence cache (see sentenceAudio): repeated sentences hit the
+  // local cache instead of the upstream TTS, avoiding 429 rate-limit 502s
+  const out = await sentenceAudio(b.text.trim());
   if (!out.ok) {
     console.error('[tts] id=' + req.id + ' upstream ' + out.kind + (out.status ? ' status=' + out.status : ''));
     return res.status(out.kind === 'timeout' ? 504 : 502)
       .json({ error: out.kind === 'timeout' ? TTS_TIMEOUT_MSG : TTS_FAIL_MSG });
   }
-  console.log('[tts] id=' + req.id + ' upstream=200 bytes=' + out.buffer.length);
+  console.log('[tts] id=' + req.id + (out.cached ? ' cache=hit' : ' upstream=200') + ' bytes=' + out.buffer.length);
   res.type('audio/wav').send(out.buffer);
 });
 

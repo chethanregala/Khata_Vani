@@ -499,7 +499,11 @@ async function speak(text) {
     return b;
   } catch (e) {
     if (e.status === 401) return goLogin();
-    say('TTS సమస్య: ' + e.message);
+    say(e.message || 'TTS సమస్య');
+    // speech is a convenience, never a gate: any card that offers the small
+    // notice shows it, saving itself is untouched by TTS failures
+    const n = $('#voiceNote');
+    if (n) n.hidden = false;
     return null;
   }
 }
@@ -830,6 +834,7 @@ function renderConfirmCard() {
       <button id="yes" class="btn primary" type="button"${p.ready ? '' : ' disabled'}>✅ అవును</button>
       <button id="no" class="btn ghost" type="button">❌ కాదు</button>
     </div>
+    <div id="voiceNote" class="tts-note" hidden>🔇 వాయిస్ అందుబాటులో లేదు — సేవ్ మాత్రం చేయవచ్చు · voice unavailable, saving still works</div>
     <button id="other" class="link wide" type="button">➕ వేరే వ్యక్తి · Different person?</button>
   </div>`;
   $('#yes').onclick = () => { if (pending && pending.ready) onYes(); };
@@ -1722,6 +1727,47 @@ const RY_MISS_TE = {
   RATE: 'రేటు', AMOUNT: 'మొత్తం', CATEGORY: 'తగ్గింపు రకం', SETTLEMENT: 'సెటిల్‌మెంట్',
 };
 
+// ---------- speech-friendly Telugu numbers (TTS) ----------
+// the TTS provider chokes on digit runs and symbols, so the voice line spells
+// every number as words (on-screen text keeps ₹/×/arrow symbols untouched)
+const TE_NUM = ['సున్నా', 'ఒకటి', 'రెండు', 'మూడు', 'నాలుగు', 'ఐదు', 'ఆరు', 'ఏడు', 'ఎనిమిది', 'తొమ్మిది'];
+const TE_TEEN = ['పది', 'పదకొండు', 'పన్నెండు', 'పదమూడు', 'పద్నాలుగు', 'పదిహేను', 'పదహారు', 'పదిఏడు', 'పద్దెనిమిది', 'పందొమ్మది'];
+const TE_TENS = { 2: 'ఇరవై', 3: 'ముప్పై', 4: 'నలభై', 5: 'యాభై', 6: 'అరవై', 7: 'డెభై', 8: 'ఎనభై', 9: 'తొంభై' };
+function teNum(n) {
+  n = Math.round(Number(n) || 0);
+  if (n < 0) return 'మైనస్ ' + teNum(-n);
+  if (n < 10) return TE_NUM[n];
+  if (n < 20) return TE_TEEN[n - 10];
+  if (n < 100) return TE_TENS[Math.floor(n / 10)] + (n % 10 ? ' ' + TE_NUM[n % 10] : '');
+  if (n < 1000) return TE_NUM[Math.floor(n / 100)] + ' వందల' + (n % 100 ? ' ' + teNum(n % 100) : '');
+  if (n < 100000) return teNum(Math.floor(n / 1000)) + ' వేల' + (n % 1000 ? ' ' + teNum(n % 1000) : '');
+  if (n < 10000000) return teNum(Math.floor(n / 100000)) + ' లక్షల' + (n % 100000 ? ' ' + teNum(n % 100000) : '');
+  if (n < 1000000000) return teNum(Math.floor(n / 10000000)) + ' కోట్ల' + (n % 10000000 ? ' ' + teNum(n % 10000000) : '');
+  return String(n); // beyond crores: leave the digits (never happens on a card)
+}
+// .5 quantities speak as the Telugu half-words the parser already knows
+function teSpeech(v) {
+  const x = Number(v);
+  if (!Number.isFinite(x)) return '';
+  if (Number.isInteger(x)) return teNum(x);
+  if (x > 0 && x < 1 && Math.abs(x - 0.5) < 0.001) return 'అర';
+  const i = Math.floor(x);
+  if (i >= 1 && Math.abs(x - (i + 0.5)) < 0.001) return teNum(i) + 'న్నర';
+  return String(x); // rare decimal: spoken as digits
+}
+const RY_UNIT_PL = { quintal: 'క్వింటాళ్ల', kg: 'కిలోలు', tonne: 'టన్నులు', bag: 'బస్తాలు' };
+// the VOICE line for the rythu confirm card — pure Telugu words, no symbols
+function rySpeechText(e, total) {
+  if (e.event === 'delivery') {
+    const unit = RY_UNIT_PL[e.unit] || (ryUnitTe(e.unit) || '');
+    const rUnit = (ryUnitTe(e.rateUnit || e.unit) || '') + 'కు';
+    const totalS = total != null ? ', మొత్తం ' + teSpeech(total) + ' రూపాయలు' : ', మొత్తం తెలియదు';
+    return `${e.name || ''}, ${e.quantity != null ? teSpeech(e.quantity) : ''} ${unit} ${PROD_TE[e.produce] || ''} అందింది. ${rUnit} ${e.rate != null ? teSpeech(e.rate) : ''} రూపాయలు${totalS}. సరిగ్గా ఉందా?`;
+  }
+  const kind = RY_EVENT_TAG[e.event] || (e.event === 'deduction' ? 'తగ్గింపు' : '');
+  return `${e.name || ''}, ${e.amount != null ? teSpeech(e.amount) : ''} రూపాయలు ${kind}. సరిగ్గా ఉందా?`;
+}
+
 function ryEventTe(ev) { return RY_EVENT_TE[ev] || '?'; }
 function ryUnitTe(u) { const x = RY_UNIT_UI.find(x => x[1] === u); return x ? x[0] : (u || ''); }
 
@@ -1999,7 +2045,13 @@ function askRythuNewFarmer(entry) {
       pending = null;
       clearFlow();
       speak(`${c.name} చేర్చాను.`);
-      if (entry) { entry.customerId = c.id; return rythuRecovery(entry); }
+      if (entry) {
+        // the name the farmer/TYPER confirmed must REPLACE the entry's name —
+        // otherwise the confirm card builds with a null name and shows "?"
+        entry.name = c.name || name;
+        entry.customerId = c.id;
+        return rythuRecovery(entry);
+      }
       if ($('#ryFarmers')) renderRythuFarmers();
     } catch (e) {
       if (e.status === 401) return goLogin();
@@ -2130,6 +2182,9 @@ function ryAskNumber(entry, field, teTitle, enSub, decimals) {
 
 // ---------- single confirm card (preview → confirm) ----------
 function askRythuConfirm(entry) {
+  // HARD GUARD: no confirm card without a resolved farmer id AND a name —
+  // a nameless card would post to an unknown customer or show "?" forever
+  if (!entry.customerId || !entry.name) return rythuRecovery(entry);
   pending = {
     kind: 'ry-single', entry, key: entry.idempotency_key || newKey(),
     settleHint: null, settleOpen: null, overWarn: false, allowAdvance: false,
@@ -2252,6 +2307,7 @@ function renderRythuConfirm() {
       <button id="ryYes" class="btn primary" type="button"${p.ready ? '' : ' disabled'}>✅ అవును</button>
       <button id="ryNo" class="btn ghost" type="button">❌ కాదు</button>
     </div>
+    <div id="voiceNote" class="tts-note" hidden>🔇 వాయిస్ అందుబాటులో లేదు — సేవ్ మాత్రం చేయవచ్చు · voice unavailable, saving still works</div>
   </div>`;
   // ---- wiring ----
   $('#ryNo').onclick = () => { clearFlow(); speak('సరే, మళ్లీ చెప్పండి.'); };
@@ -2302,9 +2358,9 @@ function renderRythuConfirm() {
       note.textContent = 'ఓపెన్ సెటిల్‌మెంట్ లేదు — అనుబంధం లేకుండా నమోదవుతుంది · unallocated';
     }
   }
-  speak(e.event === 'delivery'
-    ? `${e.name || ''} ${e.quantity || ''} ${ryUnitTe(e.unit) || ''} ${PROD_TE[e.produce] || ''}. మొత్తం ${total != null ? total : 'తెలియదు'} రూపాయలు. సరిగ్గా ఉందా?`
-    : `${e.name || ''}, ${e.amount || ''} రూపాయలు ${RY_EVENT_TAG[e.event] || ''}. సరిగ్గా ఉందా?`);
+  // the VOICE sentence is speech-friendly Telugu (numbers as words, no
+  // symbols); the on-screen card keeps ₹/× symbols untouched
+  speak(rySpeechText(e, e.event === 'delivery' ? total : e.amount));
 }
 function rySettleLabelFrom(list, id) {
   const s = (list || []).find(x => x.settlement_id === id);
