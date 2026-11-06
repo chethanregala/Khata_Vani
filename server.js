@@ -13,6 +13,7 @@ const money = require('./lib/money');
 const ledger = require('./lib/ledger');
 const parseVoice = require('./public/parser');     // rule-based parse() (+ parseVoice.diagnose)
 const resolveName = require('./public/resolver');  // name matcher, shared with the browser
+const parseRythu = require('./public/rythu-parser'); // rythu events (+ parseRythu.diagnose)
 
 const app = express();
 const B = 'https://api.vachana.ai', K = process.env.GNANI_API_KEY;
@@ -53,6 +54,7 @@ function ledgerFail(res, e, ctx) {
   if (e && e.code === 'NO_SUPA') return res.status(503).json({ error: 'డేటాబేస్ అమరిక లేదు, యజమానిని సంప్రదించండి' });
   const status = {
     OVERPAYMENT: 409, ALREADY_REVERSED: 409, CONFLICT: 409,
+    HAS_LINKED_ROWS: 409, SETTLEMENT_REQUIRED: 409, KIND_MISMATCH: 409,
     NOT_FOUND: 404, NOT_OWNED: 404,
     NOT_REVERSIBLE: 400, BAD_REQUEST: 400, NO_LEDGER: 500,
   }[(e && e.code)] || 0;
@@ -469,7 +471,7 @@ app.post('/api/tts', ttsApiLimiter, contentLength(8 * 1024), async (req, res) =>
 app.get('/api/customers', async (req, res) => {
   try {
     const [c, t] = await Promise.all([
-      db().from('customers').select('id, name, label, phone, aliases, created_at')
+      db().from('customers').select('id, name, label, phone, aliases, kind, village, created_at')
         .eq('shop_id', req.shop.id).order('name', { ascending: true }),
       db().from('transactions').select('customer_id, type, amount, created_at')
         .eq('shop_id', req.shop.id),
@@ -497,14 +499,19 @@ app.post('/api/customers', async (req, res) => {
   const name = String(b.name == null ? '' : b.name).trim().replace(/\s+/g, ' ');
   const label = b.label != null && String(b.label).trim() !== '' ? String(b.label).trim() : null;
   const phone = b.phone != null && String(b.phone).trim() !== '' ? String(b.phone).trim() : null;
+  // rythu mode creates kind='farmer' customers; kirana stays kind='customer'
+  const kind = b.kind === 'farmer' ? 'farmer' : 'customer';
+  const village = b.village != null && String(b.village).trim() !== ''
+    ? String(b.village).trim().slice(0, 60) : null;
   if (!name) return res.status(400).json({ error: 'కస్టమర్ పేరు తప్పనిసరి' });
   if (name.length > 100) return res.status(400).json({ error: 'పేరు చాలా పొడవుగా ఉంది' });
   if (label && label.length > 60) return res.status(400).json({ error: 'లేబుల్ చాలా పొడవుగా ఉంది' });
   if (phone && !/^[+0-9]{7,15}$/.test(phone)) return res.status(400).json({ error: 'ఫోన్ నంబర్ సరిలేదు' });
   try {
     const { data, error } = await db().from('customers').insert({
-      shop_id: req.shop.id, name, label, phone, aliases: [], created_at: new Date().toISOString(),
-    }).select('id, name, label, phone, aliases, created_at').single();
+      shop_id: req.shop.id, name, label, phone, kind, village,
+      aliases: [], created_at: new Date().toISOString(),
+    }).select('id, name, label, phone, aliases, kind, village, created_at').single();
     if (error) throw error;
     res.status(201).json({ ...data, balance: 0, last_activity: null });
   } catch (e) { fail(res, e, 'customers/post'); }
@@ -520,9 +527,15 @@ app.post('/api/transactions', async (req, res) => {
     const row = {
       customer_id: b.customer_id, type: b.type, amount: b.amount,
       workflow: b.workflow === 'rythu' || b.workflow === 'dairy' ? b.workflow : 'kirana',
-      direction: b.direction === 'payable' ? 'payable' : 'receivable',
-      note: b.note, produce: b.produce, deduction_category: b.deduction_category,
+      // rythu buys produce: the farmer account is always direction='payable'
+      direction: b.direction === 'payable' ? 'payable'
+        : b.workflow === 'rythu' ? 'payable' : 'receivable',
+      event: b.event, note: b.note, produce: b.produce,
+      deduction_category: b.deduction_category,
       quantity: b.quantity, rate: b.rate, unit: b.unit, rate_unit: b.rate_unit,
+      bag_kg: b.bag_kg,                       // rythu only: bag weight for the amount math
+      settlement_id: b.settlement_id,         // rythu only: explicit settlement choice
+      allow_advance: b.allow_advance === true, // rythu only: "record excess as advance"
       raw_transcript: b.raw_transcript,
       // the preview's key keeps confirm/retry consistent; a missing key still
       // gets one so a disconnected double-tap can never double-post
@@ -575,6 +588,44 @@ function buildEntries(parts) {
   }
   return out;
 }
+// rythu parts inherit only farmer/produce context between parts; each part
+// carries its own numbers (same rule as kirana's buildEntries)
+// preview-text money format (Indian digit grouping: 1,10,000)
+function fmtRupees(n) {
+  const v = Number(n);
+  return Number.isFinite(v) ? v.toLocaleString('en-IN') : '?';
+}
+function buildRythuEntries(parts, roster) {
+  const out = [];
+  let prev = null;
+  for (const part of parts) {
+    let p;
+    try { p = parseRythu(part); } catch (_) { continue; }
+    if (!p.event) continue;
+    // a later part may omit the farmer name -> inherits from the previous part
+    p.farmer = p.farmer || (prev && prev.farmer);
+    if (p.event === 'delivery') p.produce = p.produce || (prev && prev.produce);
+    const m = resolveName(p.farmer || '', roster);
+    const status = m.status;
+    const candidates = (m.candidates || []).slice(0, 5).map(x => ({ id: x.id, name: x.name }));
+    const customerId = status === 'one' && candidates[0] ? candidates[0].id : null;
+    const missing = [...(p.missing || [])];
+    if (p.farmer && !customerId) {
+      missing.push(status === 'many' || status === 'fuzzy' ? 'CUSTOMER_AMBIGUOUS' : 'CUSTOMER_UNKNOWN');
+    }
+    out.push({
+      event: p.event, name: p.farmer, transcript: part,
+      produce: p.produce, quantity: p.quantity, unit: p.unit,
+      bag_kg: p.bagKg, rate: p.rate, rateUnit: p.rateUnit,
+      amount: p.amount, category: p.category,
+      customer_id: customerId, status, candidates,
+      idempotency_key: crypto.randomUUID(), missing, warnings: [],
+    });
+    prev = p;
+  }
+  return out;
+}
+
 app.post('/api/voice/propose', async (req, res) => {
   const b = req.body || {};
   if (typeof b.transcript !== 'string' || !b.transcript.trim()) {
@@ -584,6 +635,64 @@ app.post('/api/voice/propose', async (req, res) => {
     return res.status(400).json({ error: 'వాక్యం చాలా పొడవుగా ఉంది · sentence too long' });
   }
   try {
+    if (b.workflow === 'rythu') {
+      // -- rythu: resolution runs against kind='farmer' ONLY so the same name
+      // in the two modes never collides --
+      const customers = await db().from('customers')
+        .select('id, name, village, aliases').eq('shop_id', req.shop.id).eq('kind', 'farmer');
+      if (customers.error) throw customers.error;
+      const roster = (customers.data || []).map(c => ({ ...c, label: c.village || null }));
+      const parts = splitTranscript(b.transcript).slice(0, 10);
+      const entries = buildRythuEntries(parts, roster);
+      if (!entries.length) {
+        return res.json({
+          workflow: 'rythu', candidate: [], missingFields: ['EVENT'],
+          ambiguities: [], previewText: '', balanceBefore: 0, balanceAfter: 0,
+        });
+      }
+      // per-entry preview + open-settlement hint for cash events
+      for (const e of entries) {
+        if (!e.customer_id || !e.event || e.event === 'delivery') continue;
+        const open = await ledger.openRythuSettlements(e.customer_id);
+        e.settlement_hint = open.length === 1 ? open[0].settlement_id
+          : open.length > 1 ? 'CHOOSE' : null;
+        // payments beyond the sole settlement's remaining are forewarned (409
+        // comes from the save unless the user confirms "record as advance")
+        if (e.event === 'payment' && e.settlement_hint && e.settlement_hint !== 'CHOOSE' &&
+            e.amount != null) {
+          const rem = await ledger.settlementRemaining(e.settlement_hint);
+          if (Math.round(e.amount * 100) > rem) e.warnings.push('OVERPAYMENT');
+        }
+      }
+      const missingFields = [...new Set(entries.flatMap(x => x.missing))];
+      const ambiguities = entries
+        .filter(x => x.status === 'many' || x.status === 'fuzzy' || x.status === 'none')
+        .map(x => ({ name: x.name, status: x.status, options: x.candidates }));
+      const focus = entries.find(x => x.customer_id);
+      let balanceBefore = 0;
+      if (focus) balanceBefore = (await ledger.balance(focus.customer_id, 'payable')).rupees;
+      const previewText = entries.map(e => {
+        const who = e.name || '—';
+        if (e.event === 'delivery') {
+          const q = e.quantity != null ? `${e.quantity} ${e.unit || ''}`.trim() : '?';
+          const prod = e.produce || '?';
+          const r = e.rate != null ? `₹${fmtRupees(e.rate)}/${e.rateUnit || ''}`.trim() : '';
+          const a = e.amount != null ? ` = ₹${fmtRupees(e.amount)}` : '';
+          return `${who}: ${q} ${prod} ${r}${a}`;
+        }
+        if (e.event === 'advance') return `${who} అడ్వాన్స్ ₹${e.amount != null ? fmtRupees(e.amount) : '?'}`;
+        if (e.event === 'deduction') {
+          return `${who} ${e.category || ''} తగ్గింపు ₹${e.amount != null ? fmtRupees(e.amount) : '?'}`;
+        }
+        if (e.event === 'payment') return `${who} చెల్లింపు ₹${e.amount != null ? fmtRupees(e.amount) : '?'}`;
+
+        return `${who}: ?`;
+      }).join(' · ');
+      return res.json({
+        workflow: 'rythu', candidate: entries, missingFields, ambiguities,
+        previewText, balanceBefore, balanceAfter: balanceBefore,
+      });
+    }
     const customers = await db().from('customers')
       .select('id, name, label, phone, aliases').eq('shop_id', req.shop.id);
     if (customers.error) throw customers.error;
@@ -640,7 +749,7 @@ app.post('/api/voice/propose', async (req, res) => {
 });
 
 // ---- customer helpers: every id from the client is re-checked against THIS shop ----
-const CUST_COLS = 'id, name, label, phone, aliases, created_at';
+const CUST_COLS = 'id, name, label, phone, aliases, kind, village, created_at';
 async function ownCustomer(req, id) {
   const { data, error } = await db().from('customers').select(CUST_COLS)
     .eq('id', String(id == null ? '' : id)).eq('shop_id', req.shop.id).limit(1);
@@ -649,7 +758,8 @@ async function ownCustomer(req, id) {
 }
 const squeeze = v => String(v == null ? '' : v).trim().replace(/\s+/g, ' ');
 
-// PATCH /api/customers/:id — edit name / label / phone / aliases
+// PATCH /api/customers/:id — edit name / label / phone / aliases / village.
+// kind is intentionally NOT settable here — mode flips only at creation.
 app.patch('/api/customers/:id', async (req, res) => {
   const b = req.body || {};
   try {
@@ -684,6 +794,11 @@ app.patch('/api/customers/:id', async (req, res) => {
         upd.aliases.push(s);
         if (upd.aliases.length >= 20) break;
       }
+    }
+    if (b.village !== undefined) {
+      const v = squeeze(b.village);
+      if (v.length > 60) return res.status(400).json({ error: 'గ్రామం పేరు చాలా పొడవుగా ఉంది' });
+      upd.village = v || null;
     }
     if (!Object.keys(upd).length) return res.status(400).json({ error: 'మార్పు ఏమీ లేదు' });
     const { data, error } = await db().from('customers').update(upd)
@@ -795,6 +910,42 @@ app.get('/api/transactions', async (req, res) => {
     const transactions = (t.data || []).map(x => ({ ...x, customer_name: names.get(x.customer_id) || null }));
     res.json({ date, transactions });
   } catch (e) { fail(res, e, 'transactions/get'); }
+});
+
+// ---------------- RYTHU (produce-buyer) ROUTES ----------------
+// Farmers are customers with kind='farmer'. Every route is session-shop-scoped
+// through the ledger; summaries are computed on read, never stored.
+
+// GET /api/rythu/farmers — the rythu customer list
+app.get('/api/rythu/farmers', async (req, res) => {
+  try {
+    res.json({ farmers: await ledger.rythuFarmers(req.shop.id) });
+  } catch (e) { ledgerFail(res, e, 'rythu/farmers'); }
+});
+
+// GET /api/rythu/farmers/:id/settlements — settlement cards + unallocated list
+app.get('/api/rythu/farmers/:id/settlements', async (req, res) => {
+  try {
+    res.json(await ledger.farmerSettlements(req.shop.id, String(req.params.id)));
+  } catch (e) { ledgerFail(res, e, 'rythu/settlements'); }
+});
+
+// GET /api/rythu/summary — the rythu Home strip for one IST day
+app.get('/api/rythu/summary', async (req, res) => {
+  const day = typeof req.query.date === 'string' && req.query.date ? req.query.date : undefined;
+  try {
+    res.json(await ledger.rythuSummary(req.shop.id, day));
+  } catch (e) { ledgerFail(res, e, 'rythu/summary'); }
+});
+
+// POST /api/transactions/:id/allocate { settlement_id } — apply an unallocated
+// advance/deduction/payment to a settlement (null -> id, the only linkage move)
+app.post('/api/transactions/:id/allocate', async (req, res) => {
+  const settlementId = (req.body || {}).settlement_id;
+  if (!settlementId) return res.status(400).json({ error: 'సెటిల్‌మెంట్ ఎంపిక తప్పనిసరి · settlement required' });
+  try {
+    res.json(await ledger.allocateToSettlement(req.shop.id, String(req.params.id), String(settlementId)));
+  } catch (e) { ledgerFail(res, e, 'transactions/allocate'); }
 });
 
 // ---- startup: log configuration STATE only, never values ----

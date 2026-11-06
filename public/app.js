@@ -16,6 +16,9 @@ const state = {
   recent: [],          // last 5 entries across days
   custSort: 'balance', // customers screen sort chip
   custQuery: '',       // customers screen search box
+  mode: (() => { try { return localStorage.getItem('kv-mode') === 'rythu' ? 'rythu' : 'kirana'; } catch (_) { return 'kirana'; } })(),
+  rythuFarmers: [],    // kind='farmer' customers (rythu mode)
+  rythuSummary: null,  // rythu Home strip data (one IST day, computed on read)
 };
 
 // ---------- helpers ----------
@@ -65,6 +68,7 @@ function logoSVG() {
 // ---------- router ----------
 function route() {
   const view = (location.hash || '#/splash').split('?')[0];
+  if (view.startsWith('#/rythu/farmer/')) return viewRythuFarmer(decodeURIComponent(view.slice('#/rythu/farmer/'.length)));
   if (view.startsWith('#/customer/')) return viewCustomer(decodeURIComponent(view.slice('#/customer/'.length)));
   if (view === '#/customers') return viewCustomers();
   if (view === '#/dashboard') return viewDashboard();
@@ -739,6 +743,7 @@ async function pickAmountByVoice() {
 async function handleTranscript(raw) {
   say(raw);
   showHeard(raw);
+  if (state.mode === 'rythu') return handleTranscriptRythu(raw);
   await ensureCustomers();
   const q = classifyQuery(raw);
   if (q) return runQuery(q, raw);
@@ -1318,13 +1323,41 @@ async function remind(c) {
 }
 
 // ================= #/home =================
+// mode chips (kirana | rythu) persisted in localStorage 'kv-mode'; the rythu
+// home replaces the kirana strip + recent list with the farmer day-summary
+function modeChips() {
+  return `<div class="mode-chips" id="modeChips" role="group" aria-label="మోడ్ · Mode">
+    <button class="mode-chip${state.mode === 'kirana' ? ' on' : ''}" type="button" data-mode="kirana">కిరాణా · Kirana</button>
+    <button class="mode-chip${state.mode === 'rythu' ? ' on' : ''}" type="button" data-mode="rythu">రైతు · Rythu</button>
+  </div>`;
+}
+function wireModeChips() {
+  const box = $('#modeChips');
+  if (!box) return;
+  box.querySelectorAll('[data-mode]').forEach(b => {
+    b.onclick = () => {
+      if (state.mode === b.dataset.mode) return;
+      state.mode = b.dataset.mode;
+      try { localStorage.setItem('kv-mode', state.mode); } catch (_) {}
+      location.hash = '#/home';
+      route();
+    };
+  });
+}
 async function viewHome() {
   const shop = await ensureShop();
   if (!shop) return;
+  const ry = state.mode === 'rythu';
   appEl().innerHTML = `
   ${topbar()}
   <main class="screen">
-    <div class="strip" id="strip">${skelRows(1)}</div>
+    ${modeChips()}
+    ${ry
+      ? `<div class="strip" id="ryStrip">${skelRows(2)}</div>
+         <h2 class="section">రైతులు · Farmers</h2>
+         <div class="ry-add-row"><button id="ryAdd" class="btn ghost wide" type="button">➕ కొత్త రైతు · New farmer</button></div>
+         <div id="ryFarmers" class="tx-list">${skelRows(3)}</div>`
+      : `<div class="strip" id="strip">${skelRows(1)}</div>`}
     <div class="mic-wrap" id="micWrap">
       <span class="ring r1"></span><span class="ring r2"></span><span class="ring r3"></span>
       <button id="mic" type="button" aria-label="మైక్">🎤</button>
@@ -1332,15 +1365,18 @@ async function viewHome() {
     <div id="heard" class="heard" hidden></div>
     <div id="say">నొక్కి మాట్లాడండి · Tap and speak</div>
     <div id="panel"></div>
-    <h2 class="section">ఇటీవలి నమోదులు · Last 5 entries</h2>
-    <div id="recent" class="tx-list">${skelRows(3)}</div>
+    ${ry ? '' : `<h2 class="section">ఇటీవలి నమోదులు · Last 5 entries</h2>
+    <div id="recent" class="tx-list">${skelRows(3)}</div>`}
     <div id="herr" class="err" hidden></div>
   </main>
   ${tabbar('#/home')}`;
   wireTopbar();
+  wireModeChips();
   $('#mic').onclick = toggleMic;
+  if (ry) $('#ryAdd').onclick = () => askRythuNewFarmer(null);
   try {
-    await refreshHome();
+    if (ry) await refreshRythu();
+    else await refreshHome();
   } catch (e) {
     if (e.status === 401) return goLogin();
     showErr($('#herr'), e.message);
@@ -1657,6 +1693,1120 @@ async function loadTimeline(id) {
     };
   });
   return r;
+}
+
+// ================= RYTHU MODE — produce buyer (sprint 2) =================
+// The owner BUYS produce from farmers: a farmer account (kind='farmer') carries
+// direction='payable' rows — the shop OWES the farmer until the delivery is
+// settled in cash. The server is the only authority on amounts for deliveries
+// (qty × rate, integer paise); this file only previews.
+const PROD_UI = [
+  ['వరి', 'paddy'], ['పత్తి', 'cotton'], ['మిరప', 'chilli'], ['మొక్కజొన్న', 'maize'],
+  ['శనగ', 'bengal_gram'], ['కంది', 'red_gram'], ['పెసర', 'green_gram'],
+  ['మినుము', 'black_gram'], ['వేరుశనగ', 'groundnut'], ['పసుపు', 'turmeric'],
+  ['నువ్వులు', 'sesame'], ['జొన్న', 'jowar'],
+];
+const PROD_TE = {};
+for (const [te, en] of PROD_UI) PROD_TE[en] = te;
+const RY_UNIT_UI = [['క్వింటా', 'quintal'], ['కిలో', 'kg'], ['టన్ను', 'tonne'], ['బస్తా', 'bag']];
+// the parser emits its own spellings; canonicalise to what tokenizes money-ready
+const RY_UNIT_CANON = { quintal: 'quintal', kg: 'kg', kilo: 'kg', ton: 'tonne', tonnes: 'tonne', bag: 'bag', bags: 'bag' };
+const RY_KG = { kg: 1, quintal: 100, tonne: 1000 };
+const RY_CAT_UI = [['హమాలీ', 'hamali'], ['కమీషన్', 'commission'], ['రవాణా', 'transport'], ['తరుగు', 'tharugu'], ['ఇతర', 'other']];
+const RY_CAT_TE = { hamali: 'హమాలీ', commission: 'కమీషన్', transport: 'రవాణా', tharugu: 'తరుగు', other: 'ఇతర' };
+const RY_EVENT_TE = { delivery: 'సరుకు · Delivery', advance: 'అడ్వాన్స్', deduction: 'తగ్గింపు', payment: 'చెల్లింపు' };
+const RY_EVENT_TAG = { delivery: 'సరుకు', advance: 'అడ్వాన్స్', deduction: 'తగ్గింపు', payment: 'చెల్లింపు' };
+const RY_MISS_TE = {
+  EVENT: 'ఏది? (సరుకు/అడ్వాన్స్/తగ్గింపు/చెల్లింపు)', FARMER: 'రైతు పేరు',
+  PRODUCE: 'ఏ పంట?', QUANTITY: 'ఎన్ని?', UNIT: 'ఏ కొలత?', BAG_WEIGHT: 'బస్తా బరువు',
+  RATE: 'రేటు', AMOUNT: 'మొత్తం', CATEGORY: 'తగ్గింపు రకం', SETTLEMENT: 'సెటిల్‌మెంట్',
+};
+
+function ryEventTe(ev) { return RY_EVENT_TE[ev] || '?'; }
+function ryUnitTe(u) { const x = RY_UNIT_UI.find(x => x[1] === u); return x ? x[0] : (u || ''); }
+
+// preview-only delivery total (rupees); the server recomputes it in paise
+function ryAmount(e) {
+  if (!e || e.event !== 'delivery') return null;
+  const q = Number(e.quantity), r = Number(e.rate);
+  if (!(q > 0) || !(r > 0)) return null;
+  const u = e.unit, ru = e.rateUnit || u;
+  if (u === 'bag' && ru !== 'bag' && !(Number(e.bagKg) > 0)) return null;
+  let amount = null;
+  if (u === ru) amount = q * r;
+  else if (RY_KG[u] && RY_KG[ru]) {
+    const kg = u === 'bag' ? q * Number(e.bagKg) : q * RY_KG[u];
+    amount = (kg / RY_KG[ru]) * r;
+  }
+  return amount == null ? null : Math.round(amount * 100) / 100;
+}
+
+// what is still missing from a rythu entry (drives guided recovery, in order)
+function ryMissing(e) {
+  const miss = [];
+  if (!e.event) miss.push('EVENT');
+  if (!e.customerId) miss.push('FARMER');
+  if (e.event === 'delivery') {
+    if (!e.produce) miss.push('PRODUCE');
+    if (!(Number(e.quantity) > 0)) miss.push('QUANTITY');
+    if (!e.unit) miss.push('UNIT');
+    if (e.unit === 'bag' && !(Number(e.bagKg) > 0)) miss.push('BAG_WEIGHT');
+    if (!(Number(e.rate) > 0)) miss.push('RATE');
+  } else if (e.event) {
+    if (!(Number(e.amount) > 0)) miss.push('AMOUNT');
+    if (e.event === 'deduction' && !e.category) miss.push('CATEGORY');
+  }
+  return miss;
+}
+
+// farmer/produce inheritance between parts (numbers never inherit)
+function buildRythuParts(parts) {
+  const out = [];
+  let prev = null;
+  for (const part of parts) {
+    let p;
+    try { p = parseRythu(part); } catch (_) { continue; }
+    const e = {
+      event: p.event || null, name: p.farmer || null, raw: part,
+      produce: p.produce || null, quantity: p.quantity != null ? p.quantity : null,
+      unit: RY_UNIT_CANON[p.unit] || null, bagKg: p.bagKg != null ? p.bagKg : null,
+      rate: p.rate != null ? p.rate : null, rateUnit: RY_UNIT_CANON[p.rateUnit] || null,
+      amount: p.amount != null ? p.amount : null, category: p.category || null,
+      customerId: null, idempotency_key: newKey(), source: 'voice',
+    };
+    if (p.rateUnit && !e.rateUnit && e.unit) e.rateUnit = e.unit;
+    if (!e.name && prev) e.name = prev.name;
+    if (e.event === 'delivery' && !e.produce && prev) e.produce = prev.produce;
+    if (!e.event && !e.name) continue;
+    out.push(e);
+    prev = e;
+  }
+  return out;
+}
+
+// ---------- rythu data ----------
+async function loadRythuFarmers(force) {
+  if (!force && state.rythuFarmers.length) return state.rythuFarmers;
+  const r = await api('/api/rythu/farmers');
+  state.rythuFarmers = r.farmers || [];
+  return state.rythuFarmers;
+}
+function ryRoster() {
+  return (state.rythuFarmers || []).map(f => ({ id: f.id, name: f.name, label: f.village || '' }));
+}
+function ryResolve(name) { return resolve(String(name || ''), ryRoster()); }
+// net payable to this farmer (positive = shop owes, negative = advance to recover)
+function ryNet(f) { return f ? (Number(f.payable) || 0) - (Number(f.advance) || 0) : null; }
+
+async function refreshRythu() {
+  const [sum, farmers] = await Promise.all([
+    api('/api/rythu/summary'),
+    api('/api/rythu/farmers'),
+  ]);
+  state.rythuSummary = sum;
+  state.rythuFarmers = farmers.farmers || [];
+  renderRythuStrip();
+  renderRythuFarmers();
+}
+function renderRythuStrip() {
+  const el = $('#ryStrip'); if (!el) return;
+  const s = state.rythuSummary || {};
+  el.innerHTML = `
+    <div class="stat"><span class="stat-te">సరుకు కొనుగోలు</span><span class="stat-en">Purchases today</span>
+      <b class="stat-val owed">${esc(fmtINR(s.purchases || 0))}</b></div>
+    <div class="stat"><span class="stat-te">అడ్వాన్స్‌లు</span><span class="stat-en">Advances</span>
+      <b class="stat-val paid">${esc(fmtINR(s.advances || 0))}</b></div>
+    <div class="stat"><span class="stat-te">చెల్లింపులు</span><span class="stat-en">Payments</span>
+      <b class="stat-val paid">${esc(fmtINR(s.payments || 0))}</b></div>
+    <div class="stat"><span class="stat-te">చెల్లించాల్సినది</span><span class="stat-en">Payable now</span>
+      <b class="stat-val owed">${esc(fmtINR(s.payable_total || 0))}</b></div>`;
+}
+function renderRythuFarmers() {
+  const el = $('#ryFarmers'); if (!el) return;
+  const rows = state.rythuFarmers || [];
+  if (!rows.length) {
+    el.innerHTML = emptyState('🌾', 'ఇంకా రైతులు లేరు — ➕ తో మొదటి రైతును జతచేయండి', 'No farmers yet — add the first one');
+    return;
+  }
+  el.innerHTML = rows.map(f => `
+    <div class="ry-farmer-card" data-ry-open="${esc(f.id)}" role="button" tabindex="0">
+      <span class="avatar av-${hashOf(f.id) % 6}">${esc(initialsOf(f.name))}</span>
+      <span class="tx-main"><b>${esc(f.name)}${f.village ? ` <em>${esc(f.village)}</em>` : ''}</b>
+        <small>${f.open_settlements ? `${f.open_settlements} సెటిల్‌మెంట్లు ఓపెన్` : 'ఓపెన్ సెటిల్‌మెంట్ లేదు'}</small></span>
+      <span class="tx-amt ${Number(f.payable) > 0 ? 'owed' : 'paid'}">${Number(f.payable) > 0
+        ? esc(fmtINR(f.payable)) : esc(fmtINR(-(f.advance || 0)))}</span>
+    </div>`).join('');
+  el.querySelectorAll('[data-ry-open]').forEach(card => {
+    card.onclick = () => { location.hash = '#/rythu/farmer/' + card.dataset.ryOpen; };
+    card.onkeydown = e => { if (e.key === 'Enter') location.hash = '#/rythu/farmer/' + card.dataset.ryOpen; };
+  });
+}
+
+// ---------- rythu transcript handling ----------
+async function handleTranscriptRythu(raw) {
+  try { await loadRythuFarmers(); } catch (e) { if (e.status === 401) return goLogin(); }
+  const q = classifyRythuQuery(raw);
+  if (q) return runRythuQuery(q, raw);
+  const entries = buildRythuParts(splitTranscript(raw));
+  if (!entries.length) {
+    // nothing usable — try the raw sentence once for a recovery seed
+    let seed = null;
+    try { seed = parseRythu(raw); } catch (_) {}
+    return rythuFlow({
+      event: null, name: seed && seed.farmer ? seed.farmer : null, raw,
+      produce: null, quantity: null, unit: null, bagKg: null,
+      rate: null, rateUnit: null, amount: null, category: null,
+      customerId: null, idempotency_key: newKey(), source: 'voice',
+    });
+  }
+  if (entries.length === 1) return rythuFlow(entries[0]);
+  return startRythuBatch(entries);
+}
+// "<farmer> ki entha ivvali" style questions and the rythu day summary
+function classifyRythuQuery(raw) {
+  const t = String(raw || '');
+  if (/(ఈ\s*రోజు|ఈరోజు|ee\s*roju|today)/i.test(t) &&
+      /(కొనుగోలు|కొన్న|సరుకు|అడ్వాన్స్|చెల్లింపు|purchase|advance|payment)/i.test(t)) {
+    return { kind: 'day' };
+  }
+  let p = null;
+  try { p = parseRythu(t); } catch (_) {}
+  const hasNumbers = p && (p.amount != null || p.quantity != null || p.rate != null);
+  if (/(ఎంత|entha|ఇవ్వాలి|ఇవ్వవా|ivvali|మిగిలి|బాకీ)/i.test(t) && p && p.farmer && !hasNumbers && !p.event) {
+    return { kind: 'farmer', name: p.farmer };
+  }
+  return null;
+}
+async function runRythuQuery(q) {
+  try {
+    if (q.kind === 'day') {
+      const s = await api('/api/rythu/summary');
+      renderResult({
+        title: 'ఈ రోజు · Today (రైతు)',
+        rows: [['సరుకు కొనుగోలు · Purchases', s.purchases || 0],
+               ['అడ్వాన్స్‌లు · Advances', s.advances || 0],
+               ['చెల్లింపులు · Payments', s.payments || 0]],
+      });
+      return speak(`ఈ రోజు సరుకు కొనుగోలు ${s.purchases || 0} రూపాయలు, అడ్వాన్స్ ${s.advances || 0}, చెల్లింపులు ${s.payments || 0} రూపాయలు.`);
+    }
+    await loadRythuFarmers();
+    const r = ryResolve(q.name);
+    if (r.status !== 'one' && r.candidates && r.candidates.length) {
+      return ryFarmerSheet(r.candidates, q.name, c => rySpeakFarmerTotals(c));
+    }
+    if (r.status === 'one') return rySpeakFarmerTotals(r.candidates[0]);
+    renderResult({ title: 'రైతు ఖాతా · Farmer', empty: `${q.name} — పేరు దొరకలేదు · not found` });
+    return speak(`${q.name} పేరు దొరకలేదు.`);
+  } catch (e) {
+    if (e.status === 401) return goLogin();
+    say(e.message || 'సమస్య జరిగింది');
+  }
+}
+async function rySpeakFarmerTotals(f) {
+  const d = await api('/api/rythu/farmers/' + encodeURIComponent(f.id) + '/settlements');
+  let gross = 0, adv = 0, ded = 0, pay = 0;
+  for (const s of (d.settlements || [])) {
+    if (s.status === 'reversed') continue;
+    gross += Number(s.gross) || 0;
+    adv += Number(s.advance_total) || 0;
+    ded += Number(s.deduction_total) || 0;
+    pay += Number(s.payment_total) || 0;
+  }
+  for (const u of (d.unallocated || [])) {
+    if (u.event === 'deduction') ded += Number(u.amount) || 0;
+    else adv += Number(u.amount) || 0; // advance or an unlinked payment counts as cash in our hands
+  }
+  const rem = Math.round((gross - adv - ded - pay) * 100) / 100;
+  const g = x => Math.round(x);
+  renderResult({
+    title: `${f.name} · ఖాతా`,
+    rows: [['మొత్తం సరుకు · total produce', g(gross)], ['అడ్వాన్స్ · advances', g(adv)],
+           ['తగ్గింపులు · deductions', g(ded)], ['చెల్లింపులు · payments', g(pay)],
+           ['మిగిలింది · remaining', g(rem)]],
+  });
+  return speak(`${f.name} గారి మొత్తం సరుకు ${g(gross)} రూపాయలు, అడ్వాన్స్ ${g(adv)}, తగ్గింపులు ${g(ded)}, చెల్లింపులు ${g(pay)}, మిగిలింది ${g(rem)} రూపాయలు.`);
+}
+
+// ---------- generic pick sheet (farmer / settlement choose by tap or number) ----------
+function rySheetPick(title, sub, items, onPick) {
+  // items: [{ id, name, sub }] — shared by the farmer chooser and settlement chooser
+  let sh;
+  sh = showSheet(`
+    <div class="sheet-grab"></div>
+    <div class="sheet-head">
+      <div><h3>${esc(title)}</h3><small>${esc(sub)}</small></div>
+      <button id="sheetClose" class="sheet-x" type="button" aria-label="మూసివేయండి">✕</button>
+    </div>
+    <button id="sheetMic" class="btn voice" type="button">🎤 సంఖ్య చెప్పండి · Say the number</button>
+    <div class="cand-list">${items.map((x, i) => `
+      <button class="cand-card" type="button" data-idx="${i}">
+        <span class="cand-idx">${i + 1}</span>
+        <span class="cand-main"><span class="cand-top"><b>${esc(x.name)}</b></span>
+          <span class="cand-sub">${esc(x.sub || '')}</span></span>
+      </button>`).join('')}</div>`);
+  sh.querySelector('#sheetClose').onclick = hideSheet;
+  sh.querySelector('#sheetMic').onclick = async () => {
+    if (activeRec || micBusy) return;
+    const btn = $('#sheetMic');
+    if (btn) { btn.disabled = true; btn.textContent = '… వింటున్నాను'; }
+    micBusy = true;
+    try {
+      const r = await startRecording();
+      const t = await r.done;
+      const n = numberFrom(t);
+      if (!n || n > items.length) { say(t); speak('సరిలేదు, మళ్లీ సంఖ్య చెప్పండి.'); }
+      else { hideSheet(); onPick(items[n - 1]); }
+    } catch (e) { speak(e.message || 'సమస్య జరిగింది'); }
+    finally {
+      micBusy = false;
+      const b = $('#sheetMic');
+      if (b) { b.disabled = false; b.innerHTML = '🎤 సంఖ్య చెప్పండి · Say the number'; }
+    }
+  };
+  sh.querySelectorAll('[data-idx]').forEach(b => b.onclick = () => { hideSheet(); onPick(items[Number(b.dataset.idx)]); });
+  const list = items.map((x, i) => `${TEL_NUM[i] || (i + 1)}: ${x.name}`).join(', ');
+  speak(`${title}? ${list}. సంఖ్య చెప్పండి.`);
+}
+
+// ---------- new farmer (rythu) ----------
+function askRythuNewFarmer(entry) {
+  pending = entry ? { kind: 'ry-new', entry } : { kind: 'ry-new', entry: null };
+  const el = $('#panel'); if (!el) return;
+  el.innerHTML = `
+  <div class="card">
+    <div class="q-title">కొత్త రైతు · New farmer</div>
+    <p class="q-sub">పంట అమ్మే రైతు ఖాతా. పేరు + గ్రామం (ఐచ్ఛికం) · A produce-selling farmer account + village (optional)</p>
+    <label class="field" for="ryName">పేరు · Name</label>
+    <input id="ryName" class="input" maxlength="100" value="${esc((entry && entry.name) || '')}">
+    <label class="field" for="ryVillage">గ్రామం (ఐచ్ఛికం) · Village (optional)</label>
+    <input id="ryVillage" class="input" maxlength="60">
+    <div id="ryErr" class="err" hidden></div>
+    <div class="confirm-actions">
+      <button id="ryYes" class="btn primary" type="button">✅ చేర్చండి</button>
+      <button id="ryNo" class="btn ghost" type="button">❌ కాదు</button>
+    </div>
+  </div>`;
+  $('#ryNo').onclick = () => { clearFlow(); speak('సరే.'); };
+  $('#ryYes').onclick = async () => {
+    const name = ($('#ryName').value || '').trim();
+    const village = ($('#ryVillage').value || '').trim() || null;
+    if (!name) return showErr($('#ryErr'), 'పేరు తప్పనిసరి');
+    const b = $('#ryYes'); b.disabled = true;
+    try {
+      const c = await api('/api/customers', { method: 'POST', body: { name, village, kind: 'farmer' } });
+      state.rythuFarmers = state.rythuFarmers || [];
+      state.rythuFarmers.push({ id: c.id, name: c.name, village: c.village || null, payable: 0, advance: 0, open_settlements: 0 });
+      pending = null;
+      clearFlow();
+      speak(`${c.name} చేర్చాను.`);
+      if (entry) { entry.customerId = c.id; return rythuRecovery(entry); }
+      if ($('#ryFarmers')) renderRythuFarmers();
+    } catch (e) {
+      if (e.status === 401) return goLogin();
+      b.disabled = false;
+      showErr($('#ryErr'), e.message);
+    }
+  };
+  speak('కొత్త రైతు పేరు వ్రాయండి.');
+}
+
+// ---------- guided recovery (ONE missing field at a time) ----------
+function rythuRecovery(entry) {
+  pending = { kind: 'ry-partial', entry };
+  const miss = ryMissing(entry);
+  if (!miss.length) return askRythuConfirm(entry);
+  switch (miss[0]) {
+    case 'EVENT': return ryAskEvent(entry);
+    case 'FARMER': return ryAskFarmer(entry);
+    case 'PRODUCE': return ryAskProduce(entry);
+    case 'QUANTITY': return ryAskNumber(entry, 'quantity', 'ఎన్ని?', 'Quantity (క్వింటా/కిలో/…)', true);
+    case 'UNIT': return ryAskUnit(entry);
+    case 'BAG_WEIGHT': return ryAskNumber(entry, 'bagKg', 'ఒక బస్తా ఎన్ని కిలోలు?', 'Bag weight (kg)', true);
+    case 'RATE': return ryAskNumber(entry, 'rate', 'రేటు ఎంత?', 'Rate per unit (₹)', true);
+    case 'AMOUNT': return ryAskNumber(entry, 'amount', 'ఎంత మొత్తం?', 'Amount (₹)', false);
+    case 'CATEGORY': return ryAskCategory(entry);
+  }
+}
+async function rythuFlow(entry) {
+  try { await loadRythuFarmers(); } catch (e) { if (e.status === 401) return goLogin(); }
+  const r = entry.name ? ryResolve(entry.name) : { status: 'none' };
+  if (r.status === 'one') { entry.customerId = r.candidates[0].id; return rythuRecovery(entry); }
+  if ((r.status === 'many' || r.status === 'fuzzy') && r.candidates && r.candidates.length) {
+    return ryFarmerSheet(r.candidates, entry.name, c => { entry.customerId = c.id; rythuRecovery(entry); });
+  }
+  return askRythuNewFarmer(entry);
+}
+function ryFarmerSheet(candidates, spoken, onPick) {
+  rySheetPick('ఏ రైతు?', 'Which farmer?' + (spoken ? ` · చెప్పినది: “${spoken}”` : ''),
+    candidates.map(c => ({ id: c.id, name: c.name, sub: c.label || '' })),
+    c => {
+      // remember the spoken spelling like kirana does
+      addAlias(c, spoken).then(() => onPick(c));
+    });
+}
+function ryCard(title, bodyHtml) {
+  const el = $('#panel'); if (!el) return null;
+  el.innerHTML = `<div class="card"><div class="q-title">${esc(title)}</div>${bodyHtml}</div>`;
+  return el;
+}
+function ryAskEvent(entry) {
+  const el = ryCard(entry.name ? `${entry.name} — ఏది?` : 'ఏది?',
+    `<p class="q-sub">సరుకు, అడ్వాన్స్, తగ్గింపు లేదా చెల్లింపు · What is this?</p>
+     <div class="type-choice" id="ryEv"></div>`);
+  if (!el) return;
+  speak('సరుకు, అడ్వాన్స్, తగ్గింపు లేదా చెల్లింపు?');
+  const box = $('#ryEv');
+  [['సరుకు అందింది · Delivery', 'delivery'], ['అడ్వాన్స్ · Advance', 'advance'],
+   ['తగ్గింపు · Deduction', 'deduction'], ['చెల్లింపు · Payment', 'payment']].forEach(([te, ev]) => {
+    const b = document.createElement('button');
+    b.className = 'btn' + (ev === 'delivery' ? ' primary' : '');
+    b.type = 'button';
+    b.innerHTML = te;
+    b.onclick = () => { entry.event = ev; if (ev !== 'delivery') { entry.produce = null; } rythuRecovery(entry); };
+    box.appendChild(b);
+  });
+}
+function ryAskFarmer(entry) {
+  const list = state.rythuFarmers || [];
+  if (!list.length) return askRythuNewFarmer(entry);
+  rySheetPick('ఏ రైతు?', 'Which farmer? · tap or say the number',
+    list.map(f => ({ id: f.id, name: f.name, sub: f.village || '' })),
+    f => { entry.customerId = f.id; rythuRecovery(entry); });
+}
+function ryAskProduce(entry) {
+  const el = ryCard((entry.name || '') + ' — ఏ పంట?', '<p class="q-sub">Which produce?</p><div class="chips-wrap" id="ryPr"></div>');
+  if (!el) return;
+  speak('ఏ పంట తెచ్చారు? తెరపై ఎంచుకోండి.');
+  const box = $('#ryPr');
+  PROD_UI.forEach(([te, en]) => {
+    const b = document.createElement('button');
+    b.className = 'chip-btn'; b.type = 'button'; b.textContent = te;
+    b.onclick = () => { entry.produce = en; rythuRecovery(entry); };
+    box.appendChild(b);
+  });
+}
+function ryAskUnit(entry) {
+  const el = ryCard((entry.name || '') + ' — ఏ కొలత?', '<p class="q-sub">Which unit?</p><div class="chips-wrap" id="ryUn"></div>');
+  if (!el) return;
+  speak('క్వింటా, కిలో, టన్ను, బస్తా — ఏది?');
+  const box = $('#ryUn');
+  RY_UNIT_UI.forEach(([te, en]) => {
+    const b = document.createElement('button');
+    b.className = 'chip-btn'; b.type = 'button'; b.textContent = te;
+    b.onclick = () => { entry.unit = en; if (!entry.rateUnit) entry.rateUnit = en; rythuRecovery(entry); };
+    box.appendChild(b);
+  });
+}
+function ryAskCategory(entry) {
+  const el = ryCard((entry.name || '') + ' — ఏ తగ్గింపు?', '<p class="q-sub">Which deduction?</p><div class="chips-wrap" id="ryCa"></div>');
+  if (!el) return;
+  speak('హమాలీ, కమీషన్, రవాణా, తరుగు, ఇతర — ఏది?');
+  const box = $('#ryCa');
+  RY_CAT_UI.forEach(([te, en]) => {
+    const b = document.createElement('button');
+    b.className = 'chip-btn'; b.type = 'button'; b.textContent = te;
+    b.onclick = () => { entry.category = en; rythuRecovery(entry); };
+    box.appendChild(b);
+  });
+}
+// numeric ask; decimals allowed only where money/weights make sense
+function ryAskNumber(entry, field, teTitle, enSub, decimals) {
+  const el = ryCard(`${entry.name || ''} — ${teTitle}`,
+    `<p class="q-sub">${esc(enSub)}</p>
+     <input id="ryNum" class="input" type="number" inputmode="decimal" ${decimals ? 'step="any"' : 'step="1"'} min="0">
+     <div id="ryNErr" class="err" hidden></div>
+     <div class="type-choice"><button id="ryNumOk" class="btn primary" type="button">కొనసాగించు</button></div>`);
+  if (!el) return;
+  speak(`${entry.name || ''}, ${teTitle}`);
+  $('#ryNum').focus();
+  $('#ryNumOk').onclick = () => {
+    const v = Number($('#ryNum').value);
+    if (!Number.isFinite(v) || v <= 0) return showErr($('#ryNErr'), '0 కంటే ఎక్కువ వేయండి');
+    if (!decimals && !Number.isInteger(v)) return showErr($('#ryNErr'), 'పూర్ణ సంఖ్య వేయండి');
+    entry[field] = v;
+    rythuRecovery(entry);
+  };
+}
+
+// ---------- single confirm card (preview → confirm) ----------
+function askRythuConfirm(entry) {
+  pending = {
+    kind: 'ry-single', entry, key: entry.idempotency_key || newKey(),
+    settleHint: null, settleOpen: null, overWarn: false, allowAdvance: false,
+    proposeSeq: 0, preview: null,
+  };
+  entry.idempotency_key = null; // the propose key (or a fresh one at save) is used instead
+  renderRythuConfirm();
+  runProposeRythu();
+}
+// filter the server's missing list against what the client already holds
+function ryServerBlocking(missing) {
+  return (missing || []).filter(code => {
+    if (code === 'CUSTOMER_UNKNOWN' || code === 'CUSTOMER_AMBIGUOUS') return true;
+    return false; // numbers/units come from the client entry, which recovery filled
+  });
+}
+async function runProposeRythu() {
+  const p = pending;
+  if (!p || p.kind !== 'ry-single') return;
+  const seq = ++p.proposeSeq;
+  try {
+    const v = await api('/api/voice/propose', {
+      method: 'POST', body: { transcript: String(p.entry.raw || '').trim() || (p.entry.name || ''), workflow: 'rythu' },
+    });
+    if (pending !== p || seq !== p.proposeSeq) return;
+    p.preview = v;
+    const f = v.candidate && v.candidate[0];
+    if (f) {
+      if (f.idempotency_key) p.key = f.idempotency_key;
+      if (!p.entry.customerId && f.customer_id) p.entry.customerId = f.customer_id;
+      if (!p.entry.event && f.event) p.entry.event = f.event;
+      if (!p.entry.name && f.name) p.entry.name = f.name;
+      if (!p.entry.produce && f.produce) p.entry.produce = f.produce;
+      if (p.entry.quantity == null && f.quantity != null) p.entry.quantity = f.quantity;
+      if (!p.entry.unit && f.unit) p.entry.unit = RY_UNIT_CANON[f.unit] || f.unit;
+      if (!p.entry.bagKg && f.bag_kg != null) p.entry.bagKg = f.bag_kg;
+      if (p.entry.rate == null && f.rate != null) p.entry.rate = f.rate;
+      if (!p.entry.rateUnit && f.rateUnit) p.entry.rateUnit = RY_UNIT_CANON[f.rateUnit] || f.rateUnit;
+      if (p.entry.amount == null && f.amount != null) p.entry.amount = f.amount;
+      if (!p.entry.category && f.category) p.entry.category = f.category;
+      if (f.settlement_hint) p.settleHint = f.settlement_hint;
+      p.overWarn = Array.isArray(f.warnings) && f.warnings.indexOf('OVERPAYMENT') !== -1;
+      if (p.settleHint === 'CHOOSE') {
+        try { p.settleOpen = await ryOpenSettlements(p.entry.customerId); }
+        catch (_) { p.settleOpen = []; }
+      }
+    }
+    renderRythuConfirm();
+  } catch (e) {
+    if (e.status === 401) return goLogin();
+    if (pending !== p || seq !== p.proposeSeq) return;
+    // preview unavailable — a locally minted key keeps the save idempotent
+    p.preview = { candidate: [] };
+    p.settleHint = null;
+    renderRythuConfirm();
+  }
+}
+async function ryOpenSettlements(farmerId) {
+  if (!farmerId) return [];
+  const d = await api('/api/rythu/farmers/' + encodeURIComponent(farmerId) + '/settlements');
+  return (d.settlements || []).filter(s => s.open && s.status !== 'reversed');
+}
+function ryFlipHtml(e, amount) {
+  const f = (state.rythuFarmers || []).find(x => x.id === e.customerId);
+  const before = ryNet(f);
+  if (before == null) return 'బ్యాలెన్స్ లోడ్ అవుతోంది… · loading balance…';
+  const delta = e.event === 'delivery' ? Number(amount) || 0 : -(Number(amount) || 0);
+  const after = Math.round((Number(before) + delta) * 100) / 100;
+  return `<span class="bal-flip-row"><span>${esc(fmtINR(before))}</span><span class="bal-flip-arrow">→</span>
+    <b class="${after < 0 ? 'paid' : 'owed'}">${esc(fmtINR(after))}</b></span>
+    ${after < 0 ? `<small class="advance-note">${esc(ADVANCE_TE_EN)}</small>` : ''}`;
+}
+function renderRythuConfirm() {
+  const p = pending, el = $('#panel');
+  if (!p || p.kind !== 'ry-single' || !el) return;
+  const e = p.entry;
+  const done = p.preview != null;
+  const total = ryAmount(e);
+  // a cash row with several open settlements must be pointed at one first;
+  // an overpayment needs the explicit "record as advance" confirmation
+  const needSettle = e.event && e.event !== 'delivery' && p.settleHint === 'CHOOSE' && !e.settlement_id;
+  p.ready = !!done && !ryMissing(e).length && !needSettle && !(p.overWarn && !p.allowAdvance);
+  const miss = done ? ryMissing(e) : [];
+  const f = (state.rythuFarmers || []).find(x => x.id === e.customerId);
+  el.innerHTML = `
+  <div class="card confirm">
+    <div class="confirm-head">
+      <span class="avatar av-0">${esc(initialsOf(e.name))}</span>
+      <span class="confirm-names"><b>${esc(e.name || '?')}</b><small>${esc((f && f.village) || '')}</small></span>
+      <span class="confirm-amt ${e.event === 'delivery' ? 'owed' : 'paid'}">${esc(fmtINR(e.event === 'delivery' ? (total || 0) : (e.amount || 0)))}</span>
+    </div>
+    <button id="ryEvent" class="chip-btn" type="button">${esc(ryEventTe(e.event) || '— తగదు (tap event)')}</button>
+    <button id="ryPerson" class="link wide" type="button">👤 మార్చండి · Different farmer?</button>
+    ${e.event === 'delivery' ? `
+      <div class="confirm-amount-edit">
+        <div class="ry-grid">
+          <label class="field">పంట · ${esc(PROD_TE[e.produce] || '?')}</label>
+          <input id="ryQty" class="input" type="number" inputmode="decimal" step="any" min="0" value="${esc(e.quantity != null ? e.quantity : '')}" placeholder="ఎన్ని?">
+          <div class="chips-wrap" id="ryUnitChips">${RY_UNIT_UI.map(([te, en]) =>
+            `<button class="chip-btn${e.unit === en ? ' on' : ''}" data-unit="${en}" type="button">${te}</button>`).join('')}</div>
+          ${e.unit === 'bag' ? `<input id="ryBag" class="input" type="number" inputmode="decimal" step="any" min="0" value="${esc(e.bagKg != null ? e.bagKg : '')}" placeholder="బస్తా బరువు kg">` : ''}
+          <input id="ryRate" class="input" type="number" inputmode="decimal" step="any" min="0" value="${esc(e.rate != null ? e.rate : '')}" placeholder="₹ ${esc(ryUnitTe(e.rateUnit || e.unit) || '')}కి రేటు">
+        </div>
+        <div class="bal-flip" id="ryTotal">${e.event === 'delivery' && total != null ? `మొత్తం · Total ₹${total.toLocaleString('en-IN')}` : 'మొత్తం లెక్క అవుతోంది…'}</div>
+        <div class="bal-flip" id="ryFlip">${ryFlipHtml(e, total || 0)}</div>
+      </div>`
+    : e.event ? `
+      <div class="confirm-amount-edit">
+        <label class="field" for="ryAmt">మొత్తం · Amount (₹)</label>
+        <input id="ryAmt" class="input" type="number" inputmode="numeric" step="1" min="1" value="${esc(e.amount != null ? Math.round(e.amount) : '')}">
+        ${e.event === 'deduction' ? `<div class="chips-wrap" id="ryCatChips">${RY_CAT_UI.map(([te, en]) =>
+          `<button class="chip-btn${e.category === en ? ' on' : ''}" data-cat="${en}" type="button">${te}</button>`).join('')}</div>` : ''}
+        <div class="bal-flip" id="ryFlip">${ryFlipHtml(e, e.amount || 0)}</div>
+        <div class="settle-note" id="rySettleNote"></div>
+      </div>`
+    : ''}
+    ${p.overWarn ? `<div class="warn-note">జమ ఈ సెటిల్‌మెంట్ మిగిలిన మొత్తం కంటే ఎక్కువ — <button id="ryAdv" class="chip-btn${p.allowAdvance ? ' on' : ''}" type="button">మిగిలింది అడ్వాన్స్‌గా నమోదు · record excess as advance</button></div>` : ''}
+    ${miss.length || needSettle ? `<div class="missing-note">అవసరం · needed: ${esc([...miss, ...(needSettle ? ['SETTLEMENT'] : [])].map(m => RY_MISS_TE[m] || m).join(', '))}</div>` : ''}
+    <div class="confirm-actions">
+      <button id="ryYes" class="btn primary" type="button"${p.ready ? '' : ' disabled'}>✅ అవును</button>
+      <button id="ryNo" class="btn ghost" type="button">❌ కాదు</button>
+    </div>
+  </div>`;
+  // ---- wiring ----
+  $('#ryNo').onclick = () => { clearFlow(); speak('సరే, మళ్లీ చెప్పండి.'); };
+  $('#ryEvent').onclick = () => { const x = pending; if (x && x.kind === 'ry-single') { x.entry.event = null; x.entry.amount = null; rythuRecovery(x.entry); } };
+  $('#ryPerson').onclick = () => {
+    rySheetPick('ఏ రైతు?', 'Which farmer?', (state.rythuFarmers || [])
+      .map(x => ({ id: x.id, name: x.name, sub: x.village || '' })),
+      c => { e.customerId = c.id; renderRythuConfirm(); });
+  };
+  const yes = $('#ryYes');
+  if (yes) yes.onclick = () => { if (pending && pending.ready) onRythuYes(); };
+  // delivery fields
+  const qty = $('#ryQty'), rate = $('#ryRate'), bag = $('#ryBag');
+  if (qty) qty.addEventListener('input', () => { e.quantity = Number(qty.value) || null; rySync(); });
+  if (rate) rate.addEventListener('input', () => { e.rate = Number(rate.value) || null; rySync(); });
+  if (bag) bag.addEventListener('input', () => { e.bagKg = Number(bag.value) || null; rySync(); });
+  el.querySelectorAll('[data-unit]').forEach(b => {
+    b.onclick = () => { e.unit = b.dataset.unit; if (!e.rateUnit) e.rateUnit = e.unit; renderRythuConfirm(); };
+  });
+  el.querySelectorAll('[data-cat]').forEach(b => {
+    b.onclick = () => { e.category = b.dataset.cat; renderRythuConfirm(); };
+  });
+  const amt = $('#ryAmt');
+  if (amt) amt.addEventListener('input', () => { e.amount = Number(amt.value) || null; rySync(); });
+  const adv = $('#ryAdv');
+  if (adv) adv.onclick = () => { p.allowAdvance = !p.allowAdvance; renderRythuConfirm(); };
+  // settlement pick (CHOOSE case)
+  const note = $('#rySettleNote');
+  if (note) {
+    if (p.settleHint === 'CHOOSE') {
+      note.innerHTML = `<p class="q-sub">ఒకటి కంటే ఎక్కువ సెటిల్‌మెంట్లు ఓపెన్ — ఎంచుకోండి:</p>
+        <button id="ryPickSettle" class="btn" type="button">${e.settlement_id ? esc(rySettleLabelFrom(p.settleOpen, e.settlement_id)) : 'సెటిల్‌మెంట్ ఎంచుకోండి'}</button>`;
+      $('#ryPickSettle').onclick = () => {
+        const items = (p.settleOpen || []).map(s => ({
+          id: s.settlement_id,
+          name: `${PROD_TE[s.produce] || s.produce || '—'} ${s.quantity || ''} ${ryUnitTe(s.unit)}`,
+          sub: `మిగిలింది ₹${fmtINR(s.remaining)}`,
+        }));
+        if (!items.length) { speak('ఓపెన్ సెటిల్‌మెంట్లు లేవు.'); return; }
+        rySheetPick('ఏ సెటిల్‌మెంట్?', 'Which settlement?', items,
+          s => { e.settlement_id = s.id; renderRythuConfirm(); });
+      };
+    } else if (e.settlement_id) {
+      note.textContent = 'ఈ సెటిల్‌మెంట్‌కు అనుబంధించబడుతుంది · will link to the chosen settlement';
+    } else if (p.settleHint && p.settleHint !== 'CHOOSE') {
+      note.textContent = 'ఓపెన్ సెటిల్‌మెంట్ ఒక్కటే ఉంది — ఆటోమాటిక్‌గా అనుబంధిస్తాము · auto-links';
+    } else {
+      note.textContent = 'ఓపెన్ సెటిల్‌మెంట్ లేదు — అనుబంధం లేకుండా నమోదవుతుంది · unallocated';
+    }
+  }
+  speak(e.event === 'delivery'
+    ? `${e.name || ''} ${e.quantity || ''} ${ryUnitTe(e.unit) || ''} ${PROD_TE[e.produce] || ''}. మొత్తం ${total != null ? total : 'తెలియదు'} రూపాయలు. సరిగ్గా ఉందా?`
+    : `${e.name || ''}, ${e.amount || ''} రూపాయలు ${RY_EVENT_TAG[e.event] || ''}. సరిగ్గా ఉందా?`);
+}
+function rySettleLabelFrom(list, id) {
+  const s = (list || []).find(x => x.settlement_id === id);
+  return s ? `${PROD_TE[s.produce] || s.produce || '—'} · మిగిలింది ₹${fmtINR(s.remaining)}` : 'సెటిల్‌మెంట్ ఎంచుకోండి';
+}
+// recompute the live bits without re-rendering the whole card
+function rySync() {
+  const p = pending;
+  if (!p || p.kind !== 'ry-single') return;
+  const e = p.entry, el = $('#panel');
+  if (!el) return;
+  const total = ryAmount(e) || 0;
+  const big = $('.confirm-amt', el);
+  if (big) big.textContent = fmtINR(e.event === 'delivery' ? total : (e.amount || 0));
+  if (e.event === 'delivery') {
+    const t = $('#ryTotal');
+    if (t) t.textContent = total != null ? `మొత్తం · Total ₹${total.toLocaleString('en-IN')}` : 'మొత్తం లెక్క అవుతోంది…';
+  }
+  const flip = $('#ryFlip');
+  if (flip) flip.innerHTML = ryFlipHtml(e, e.event === 'delivery' ? total : (e.amount || 0));
+  const needSettle = e.event && e.event !== 'delivery' && p.settleHint === 'CHOOSE' && !e.settlement_id;
+  p.ready = p.preview != null && !ryMissing(e).length && !needSettle && !(p.overWarn && !p.allowAdvance);
+  const yes = $('#ryYes');
+  if (yes) yes.disabled = !p.ready;
+}
+async function onRythuYes() {
+  const p = pending;
+  const el = $('#panel');
+  if (!p || p.kind !== 'ry-single' || !el) return;
+  el.querySelectorAll('button').forEach(b => { b.disabled = true; });
+  try {
+    await postRythu(p.entry, { idempotency_key: p.key || newKey() });
+    pending = null;
+    clearFlow();
+    speak('నమోదు చేశాను. · saved');
+    await refreshRythu().catch(() => {});
+  } catch (e) {
+    const code = (e.data && e.data.code) || '';
+    if (e.status === 401) return goLogin();
+    if (code === 'SETTLEMENT_REQUIRED') return ryChooseSettleThenRetry(p);
+    if (code === 'OVERPAYMENT') return ryOverpayThenRetry(p);
+    el.querySelectorAll('button').forEach(b => { b.disabled = false; });
+    speak(e.message || 'సేవ్ కాలేదు, మళ్లీ ప్రయత్నించండి');
+  }
+}
+// POST /api/transactions for one rythu entry; extra overriding fields allowed
+async function postRythu(e, extra) {
+  const body = { customer_id: e.customerId, workflow: 'rythu', idempotency_key: e.idempotency_key || newKey(), raw_transcript: e.raw || '', source: e.source || 'voice' };
+  if (e.event === 'delivery') {
+    Object.assign(body, {
+      type: 'credit', event: 'produce_delivery', produce: e.produce,
+      quantity: String(e.quantity), unit: e.unit, rate: String(e.rate),
+      rate_unit: e.rateUnit || e.unit,
+      bag_kg: Number(e.bagKg) > 0 ? String(e.bagKg) : undefined,
+    });
+  } else {
+    Object.assign(body, {
+      type: 'pay', event: e.event, amount: Math.round(Number(e.amount)),
+      settlement_id: e.settlement_id || undefined,
+      deduction_category: e.event === 'deduction' ? e.category : undefined,
+    });
+  }
+  return api('/api/transactions', { method: 'POST', body: Object.assign(body, extra || {}) });
+}
+// 409 SETTLEMENT_REQUIRED → pick an open settlement, then retry the same POST
+async function ryChooseSettleThenRetry(p) {
+  let open = [];
+  try { open = await ryOpenSettlements(p.entry.customerId); } catch (_) {}
+  const items = open.map(s => ({
+    id: s.settlement_id,
+    name: `${PROD_TE[s.produce] || s.produce || '—'} ${s.quantity || ''} ${ryUnitTe(s.unit)}`,
+    sub: `మిగిలింది ₹${fmtINR(s.remaining)}`,
+  }));
+  if (!items.length) { speak('ఓపెన్ సెటిల్‌మెంట్లు లేవు, మళ్లీ చెప్పండి.'); pending = null; clearFlow(); return; }
+  rySheetPick('ఏ సెటిల్‌మెంట్?', 'One settlement has to be picked', items, s => {
+    p.entry.settlement_id = s.id;
+    p.settleHint = null;
+    return postRythuRetry(p);
+  });
+}
+// 409 OVERPAYMENT → explicit consent to record the excess as advance
+function ryOverpayThenRetry(p) {
+  const el = $('#panel');
+  el.innerHTML = `
+  <div class="card">
+    <div class="q-title">జమ ఎక్కువ అయింది · Payment exceeds the remaining</div>
+    <p class="q-sub">ఈ సెటిల్‌మెంట్‌లో అంత మొత్తం లేదు. మిగిలిన భాగాన్ని కొత్త అడ్వాన్స్‌గా నమోదు చేయాలా? · Record the excess as a new advance?</p>
+    <div class="confirm-actions">
+      <button id="ryAdvOk" class="btn primary" type="button">✅ అడ్వాన్స్‌గా నమోదు చేయండి</button>
+      <button id="ryAdvNo" class="btn ghost" type="button">❌ వదులుకోండి</button>
+    </div>
+  </div>`;
+  speak('జమ మిగిలిన మొత్తం కంటే ఎక్కువ. తక్కినది అడ్వాన్స్‌గా నమోదు చేయాలా?');
+  $('#ryAdvOk').onclick = () => postRythuRetry(p, { allow_advance: true });
+  $('#ryAdvNo').onclick = () => { pending = null; clearFlow(); speak('సరే.'); };
+}
+async function postRythuRetry(p, extra) {
+  try {
+    await postRythu(p.entry, Object.assign({ idempotency_key: p.key || newKey() }, extra || {}));
+    pending = null;
+    clearFlow();
+    speak('నమోదు చేశాను. · saved');
+    await refreshRythu().catch(() => {});
+  } catch (e) {
+    if (e.status === 401) return goLogin();
+    speak(e.message || 'సేవ్ కాలేదు');
+    pending = null;
+    clearFlow();
+  }
+}
+
+// ---------- rythu batch (multi-part sentence, sequential posts) ----------
+function startRythuBatch(entries) {
+  pending = {
+    kind: 'ry-batch',
+    entries: entries.map(e => {
+      const r = ryResolve(e.name);
+      const x = { ...e };
+      if (r.status === 'one') x.customerId = r.candidates[0].id;
+      return x;
+    }),
+  };
+  renderRythuBatch();
+  const line = entries.map(e => `${e.name || ''} ${e.event === 'delivery'
+    ? `${e.quantity || ''} ${ryUnitTe(e.unit) || ''} ${PROD_TE[e.produce] || ''}`
+    : `${e.amount != null ? e.amount + ' రూపాయలు' : ''} ${RY_EVENT_TAG[e.event] || '?'}`}`).join(', ');
+  speak(line + '. సరిగ్గా ఉందా?');
+}
+function ryEntryLine(e) {
+  return e.event === 'delivery'
+    ? `${e.quantity != null ? e.quantity : '?'} ${ryUnitTe(e.unit) || '?'} ${PROD_TE[e.produce] || '?'} × ₹${e.rate != null ? e.rate : '?'}`
+    : `${e.amount != null ? fmtINR(e.amount) : '₹?'} ${ryEventTe(e.event)}${e.event === 'deduction' && e.category ? ' (' + esc(RY_CAT_TE[e.category] || e.category) + ')' : ''}`;
+}
+function renderRythuBatch() {
+  const p = pending, el = $('#panel');
+  if (!el) return;
+  if (!p || p.kind !== 'ry-batch') return;
+  if (!p.entries.length) { clearFlow(); return speak('సరే, మళ్లీ చెప్పండి.'); }
+  el.innerHTML = `
+  <div class="card">
+    <div class="q-title">${p.entries.length} నమోదులు · entries</div>
+    <p class="q-sub">రైతు నమోదులు ఒక్కొక్కటిగా సేవ్ అవుతాయి; సరుకు ముందు నమోదైతె అడ్వాన్స్/తగ్గింపు/చెల్లింపు దానికే అనుబంధించబడతాయి</p>
+    <ul class="entry-list">${p.entries.map((e, i) => `
+      <li class="entry">
+        <span class="idx">${i + 1}</span>
+        <span class="entry-main"><b>${esc(e.name || '?')}</b><small>${esc(ryEntryLine(e))}</small>
+          ${ryMissing(e).length ? `<small class="warn-note">⚠ ${esc(ryMissing(e).map(m => RY_MISS_TE[m] || m).join(', '))}</small>` : ''}</span>
+        <button class="del" type="button" data-del="${i}" aria-label="తొలగించండి">🗑</button>
+      </li>`).join('')}</ul>
+    <div class="confirm-actions">
+      <button id="ryYes" class="btn primary" type="button">✅ అవును</button>
+      <button id="ryNo" class="btn ghost" type="button">❌ కాదు</button>
+    </div>
+  </div>`;
+  el.querySelectorAll('[data-del]').forEach(b => { b.onclick = () => { p.entries.splice(Number(b.dataset.del), 1); renderRythuBatch(); }; });
+  $('#ryNo').onclick = () => { pending = null; clearFlow(); speak('సరే, మళ్లీ చెప్పండి.'); };
+  $('#ryYes').onclick = () => saveRythuBatch(0);
+}
+async function saveRythuBatch(i) {
+  const p = pending;
+  if (!p || p.kind !== 'ry-batch') return;
+  const e = p.entries[i];
+  if (!e) {
+    pending = null;
+    clearFlow();
+    speak('నమోదు చేశాను. · saved');
+    return refreshRythu().catch(() => {});
+  }
+  try {
+    await postRythu(e, { idempotency_key: e.idempotency_key || newKey() });
+    return saveRythuBatch(i + 1);
+  } catch (err) {
+    if (err.status === 401) return goLogin();
+    const code = (err.data && err.data.code) || '';
+    speak(err.message || 'సేవ్ కాలేదు');
+    const el = $('#panel');
+    el.innerHTML = `
+    <div class="card">
+      <div class="q-title">నమోదు ${i + 1} అడ్డుకున్నది</div>
+      <p class="q-sub">${esc(err.message || 'సమస్య జరిగింది')}</p>
+      <div class="confirm-actions" id="ryBatchFix"></div>
+    </div>`;
+    const box = $('#ryBatchFix');
+    const skip = () => saveRythuBatch(i + 1);
+    if (code === 'SETTLEMENT_REQUIRED') {
+      const b = document.createElement('button');
+      b.className = 'btn primary'; b.type = 'button'; b.textContent = 'సెటిల్‌మెంట్ ఎంచుకోండి';
+      b.onclick = async () => {
+        let open = [];
+        try { open = await ryOpenSettlements(p.entries[i].customerId); } catch (_) {}
+        const items = open.map(s => ({
+          id: s.settlement_id,
+          name: `${PROD_TE[s.produce] || s.produce || '—'} ${s.quantity || ''} ${ryUnitTe(s.unit)}`,
+          sub: `మిగిలింది ₹${fmtINR(s.remaining)}`,
+        }));
+        if (!items.length) { speak('ఓపెన్ సెటిల్‌మెంట్లు లేవు.'); return; }
+        rySheetPick('ఏ సెటిల్‌మెంట్?', 'One settlement has to be picked', items, s => {
+          p.entries[i].settlement_id = s.id;
+          postRythu(p.entries[i], { idempotency_key: p.entries[i].idempotency_key || newKey() })
+            .then(() => saveRythuBatch(i + 1)).catch(err2 => speak(err2.message || 'సేవ్ కాలేదు'));
+        });
+      };
+      box.appendChild(b);
+    }
+    if (code === 'OVERPAYMENT') {
+      const b = document.createElement('button');
+      b.className = 'btn primary'; b.type = 'button'; b.textContent = 'అడ్వాన్స్‌గా నమోదు';
+      b.onclick = () => postRythu(pending.entries[i], { idempotency_key: pending.entries[i].idempotency_key || newKey(), allow_advance: true }).then(() => saveRythuBatch(i + 1)).catch(() => {});
+      box.appendChild(b);
+    }
+    if (code === 'KIND_MISMATCH') {
+      const n = document.createElement('button');
+      n.className = 'btn primary'; n.type = 'button'; n.textContent = 'కొత్త రైతుగా బదిలీ · move to a farmer';
+      n.onclick = () => askRythuNewFarmer(pending.entries[i]);
+      box.appendChild(n);
+    }
+    const c = document.createElement('button');
+    c.className = 'btn ghost'; c.type = 'button'; c.textContent = '⏭ వదిలేయి · skip';
+    c.onclick = skip;
+    box.appendChild(c);
+  }
+}
+
+// ================= #/rythu/farmer/:id — settlements detail =================
+async function viewRythuFarmer(id) {
+  const shop = await ensureShop();
+  if (!shop) return;
+  let d;
+  try { d = await api('/api/rythu/farmers/' + encodeURIComponent(id) + '/settlements'); }
+  catch (e) {
+    if (e.status === 401) return goLogin();
+    if (e.status === 404 || (e.data && e.data.error)) { location.hash = '#/home'; return; }
+    throw e;
+  }
+  const f = d.customer || { name: '—' };
+  state.rythuFarmerId = id;
+  appEl().innerHTML = `
+  <header class="topbar">
+    <button id="back" class="back" type="button" aria-label="వెనుకకు">‹</button>
+    <span class="shop-name">${esc(f.name)}</span>
+    <button id="logout" class="logout" type="button">లాగ్ అవుట్</button>
+  </header>
+  <main class="screen">
+    <div class="card detail-head">
+      <span class="avatar big av-0">${esc(initialsOf(f.name))}</span>
+      <div class="detail-id"><b>${esc(f.name)}</b><small>${esc(f.village || '')}</small></div>
+      <div class="detail-bal">
+        <small>${Number(d.balance) > 0 ? 'మేము చెల్లించాల్సినది · we owe' : 'అడ్వాన్స్ · advance'}</small>
+        <b class="bal ${Number(d.balance) > 0 ? 'owed' : ''}">${esc(fmtINR(Math.abs(Number(d.balance) || 0)))}</b>
+        ${Number(d.balance) < 0 ? `<small class="advance-note">${esc(ADVANCE_TE_EN)}</small>` : ''}
+      </div>
+    </div>
+    <div class="chips-wrap" id="ryActions">
+      <button class="chip-btn" type="button" data-act="delivery">🌾 సరుకు అందింది</button>
+      <button class="chip-btn" type="button" data-act="advance">💸 అడ్వాన్స్</button>
+      <button class="chip-btn" type="button" data-act="deduction">✂️ తగ్గింపు</button>
+      <button class="chip-btn" type="button" data-act="payment">💵 చెల్లింపు</button>
+    </div>
+    <div id="ryForm" class="card" hidden></div>
+    <h2 class="section">సెటిల్‌మెంట్లు · Settlements</h2>
+    <div id="rySettleList">${skelRows(2)}</div>
+    ${(d.unallocated || []).length ? `<h2 class="section">అనుబంధం లేని నమోదులు · Unallocated</h2>
+    <div id="ryUnalloc"></div>` : ''}
+    <div id="ryerr" class="err" hidden></div>
+  </main>
+  ${tabbar('#/home')}`;
+  wireTopbar();
+  $('#back').onclick = () => { state.mode = 'rythu'; location.hash = '#/home'; };
+  renderRythuSettlements(d);
+  // quick actions: 48px chips opening ONE shared form
+  const forms = {
+    delivery(e) {
+      e.hidden = false;
+      e.innerHTML = `
+      <div class="q-title">సరుకు అందింది · Produce delivery</div>
+      <div class="chips-wrap" id="qfProd">${PROD_UI.map(([te, en]) => `<button class="chip-btn" data-v="${en}" type="button">${te}</button>`).join('')}</div>
+      <label class="field" for="qfQty">ఎన్ని · Quantity</label>
+      <input id="qfQty" class="input" type="number" inputmode="decimal" step="any" min="0">
+      <div class="chips-wrap" id="qfUnit">${RY_UNIT_UI.map(([te, en]) => `<button class="chip-btn" data-v="${en}" type="button">${te}</button>`).join('')}</div>
+      <div id="qfBagWrap" hidden><label class="field" for="qfBag">బస్తా బరువు kg · bag weight</label>
+        <input id="qfBag" class="input" type="number" inputmode="decimal" step="any" min="0"></div>
+      <label class="field" for="qfRate">రేటు · Rate (₹ per unit)</label>
+      <input id="qfRate" class="input" type="number" inputmode="decimal" step="any" min="0">
+      <div id="qfErr" class="err" hidden></div>
+      <button id="qfSave" class="btn primary big" type="button">నమోదు · Save</button>`;
+      let prod = null, unit = null;
+      e.querySelector('#qfProd').addEventListener('click', ev => {
+        const b = ev.target.closest('[data-v]'); if (!b) return;
+        e.querySelectorAll('#qfProd .chip-btn').forEach(x => x.classList.toggle('on', x === b));
+        prod = b.dataset.v;
+      });
+      e.querySelector('#qfUnit').addEventListener('click', ev => {
+        const b = ev.target.closest('[data-v]'); if (!b) return;
+        e.querySelectorAll('#qfUnit .chip-btn').forEach(x => x.classList.toggle('on', x === b));
+        unit = b.dataset.v;
+        e.querySelector('#qfBagWrap').hidden = unit !== 'bag';
+      });
+      ryQfSave(e, () => {
+        if (!prod) return 'పంట ఎంచుకోండి';
+        if (!(Number(e.querySelector('#qfQty').value) > 0)) return 'ఎన్ని? అంత వేయండి';
+        if (!unit) return 'కొలత ఎంచుకోండి';
+        if (unit === 'bag' && !(Number(e.querySelector('#qfBag').value) > 0)) return 'బస్తా బరువు వేయండి';
+        if (!(Number(e.querySelector('#qfRate').value) > 0)) return 'రేటు వేయండి';
+        return {
+          customer_id: id, workflow: 'rythu', type: 'credit', event: 'produce_delivery',
+          produce: prod, quantity: e.querySelector('#qfQty').value, unit,
+          bag_kg: unit === 'bag' ? e.querySelector('#qfBag').value : undefined,
+          rate: e.querySelector('#qfRate').value, rate_unit: unit,
+          raw_transcript: 'produce delivery (screen)', idempotency_key: newKey(), source: 'screen',
+        };
+      });
+    },
+    async cash(event, cat) {
+      const open = await ryOpenSettlements(id);
+      e.hidden = false;
+      e.innerHTML = `
+      <div class="q-title">${esc(ryEventTe(event))}</div>
+      <label class="field" for="qfAmt">మొత్తం · Amount (₹)</label>
+      <input id="qfAmt" class="input" type="number" inputmode="numeric" step="1" min="1">
+      ${event === 'deduction' ? `<p class="q-sub">తగ్గింపు రకం · Category</p>
+        <div class="chips-wrap" id="qfCat">${RY_CAT_UI.map(([te, en]) =>
+        `<button class="chip-btn${en === cat ? ' on' : ''}" data-v="${en}" type="button">${te}</button>`).join('')}</div>` : ''}
+      ${open.length > 1 ? `<label class="field" for="qfSettle">సెటిల్‌మెంట్ · Settlement</label>
+        <select id="qfSettle" class="input">${open.map(s =>
+        `<option value="${esc(s.settlement_id)}">${esc(PROD_TE[s.produce] || s.produce || '—')} · మిగిలింది ₹${esc(fmtINR(s.remaining))}</option>`).join('')}</select>` : ''}
+      <div id="qfErr" class="err" hidden></div>
+      <button id="qfSave" class="btn primary big" type="button">నమోదు · Save</button>`;
+      if (event === 'deduction') {
+        e.querySelector('#qfCat').addEventListener('click', ev => {
+          const b = ev.target.closest('[data-v]'); if (!b) return;
+          cat = b.dataset.v;
+          e.querySelectorAll('#qfCat .chip-btn').forEach(x => x.classList.toggle('on', x === b));
+        });
+        if (!cat) cat = null;
+      }
+      ryQfSave(e, () => {
+        if (event === 'deduction' && !cat) throw 'తగ్గింపు రకం ఎంచుకోండి';
+        if (!(Number(e.querySelector('#qfAmt').value) > 0)) throw 'మొత్తం 0 కంటే ఎక్కువ వేయండి';
+        const body = {
+          customer_id: id, workflow: 'rythu', type: 'pay', event,
+          amount: Number(e.querySelector('#qfAmt').value),
+          raw_transcript: `${event} (screen)`, idempotency_key: newKey(), source: 'screen',
+        };
+        if (event === 'deduction') body.deduction_category = cat;
+        return body;
+      }, () => (open.length > 1 ? e.querySelector('#qfSettle').value : undefined));
+    },
+  };
+  // screens-level overpayment recover: one retry with allow_advance after consent
+  function ryQfSave(e, bodyFn, settleFn) {
+    const btn = e.querySelector('#qfSave');
+    btn.onclick = async () => {
+      const errEl = e.querySelector('#qfErr');
+      hideErr(errEl);
+      let body;
+      try { body = bodyFn(); } catch (msg) { return showErr(errEl, String(msg)); }
+      if (!body) return showErr(errEl, 'వివరాలు సరిలేవు');
+      const settleId = settleFn && settleFn();
+      if (settleId) body.settlement_id = settleId;
+      btn.disabled = true;
+      try {
+        await api('/api/transactions', { method: 'POST', body });
+        speak('నమోదు చేశాను. · saved');
+        e.hidden = true;
+        await viewRythuFarmer(id);
+      } catch (err) {
+        btn.disabled = false;
+        if (err.status === 401) return goLogin();
+        if ((err.data && err.data.code) === 'OVERPAYMENT') {
+          showErr(errEl, err.message + ' — మిగిలింది అడ్వాన్స్‌గా నమోదు చేయాలంటే మళ్లీ నొక్కండి');
+          btn.onclick = async () => {
+            btn.disabled = true;
+            try {
+              await api('/api/transactions', { method: 'POST', body: { ...body, allow_advance: true } });
+              speak('అడ్వాన్స్‌గా నమోదు చేశాను.');
+              e.hidden = true;
+              await viewRythuFarmer(id);
+            } catch (e2) { btn.disabled = false; if (e2.status === 401) return goLogin(); showErr(errEl, e2.message); }
+          };
+          return;
+        }
+        showErr(errEl, err.message);
+      }
+    };
+  }
+  $('#ryActions').querySelectorAll('[data-act]').forEach(b => {
+    b.onclick = async () => {
+      const e = $('#ryForm');
+      if (b.dataset.act === 'delivery') return forms.delivery(e);
+      if (b.dataset.act === 'deduction') return forms.cash('deduction', 'hamali');
+      return forms.cash(b.dataset.act, null);
+    };
+  });
+  function renderRythuSettlements(dd) {
+    const box = $('#rySettleList'); if (!box) return;
+    if (!(dd.settlements || []).length) {
+      box.innerHTML = emptyState('🌾', 'ఇంకా సరుకు నమోదులు లేవు', 'No deliveries yet');
+    } else {
+      box.innerHTML = dd.settlements.map(s => rySettleCard(s)).join('');
+      box.querySelectorAll('[data-rev-tx]').forEach(b => { b.onclick = () => ryReverseCard(b.dataset.revTx, () => viewRythuFarmer(id)); });
+    }
+    const ub = $('#ryUnalloc');
+    if (ub && (dd.unallocated || []).length) {
+      ub.innerHTML = (dd.unallocated || []).map(u => `
+      <div class="ry-line">
+        <span class="ry-line-main"><b>${esc(RY_EVENT_TAG[u.event] || u.event)} ${esc(u.deduction_category ? '· ' + (RY_CAT_TE[u.deduction_category] || u.deduction_category) : '')}</b>
+          <small>${esc(timeOf(u.created_at))}</small></span>
+        <b class="ry-amt">${esc(fmtINR(u.amount))}</b>
+        <button class="btn small" type="button" data-alloc="${esc(u.id)}">సెటిల్‌మెంట్‌లో చేర్చండి</button>
+      </div>`).join('');
+      const openSettle = (dd.settlements || []).filter(s => s.open && s.status !== 'reversed');
+      ub.querySelectorAll('[data-alloc]').forEach(b => {
+        b.onclick = () => {
+          if (!openSettle.length) { speak('ఓపెన్ సెటిల్‌మెంట్లు లేవు.'); return; }
+          rySheetPick('ఏ సెటిల్‌మెంట్?', 'Apply to which settlement?',
+            openSettle.map(s => ({ id: s.settlement_id, name: `${PROD_TE[s.produce] || s.produce || '—'} ${s.quantity || ''} ${ryUnitTe(s.unit)}`, sub: `మిగిలింది ₹${fmtINR(s.remaining)}` })),
+            async s => {
+              try {
+                await api('/api/transactions/' + b.dataset.alloc + '/allocate', { method: 'POST', body: { settlement_id: s.id } });
+                speak('అనుసంధానించాను.');
+                await viewRythuFarmer(id);
+              } catch (err) { if (err.status === 401) return goLogin(); showErr($('#ryerr'), err.message); }
+            });
+        };
+      });
+    }
+  }
+}
+function rySettleCard(s) {
+  const reversed = s.status === 'reversed';
+  const badge = reversed
+    ? '<span class="badge settled">రద్దు · Reversed</span>'
+    : s.open ? '<span class="badge open">ఓపెన్ · Open</span>' : '<span class="badge settled">ఇచ్చేసింది · Settled</span>';
+  const rows = [];
+  const push = (list, evLabel, catMap) => {
+    for (const r of (list || [])) {
+      rows.push(`<div class="ry-line">
+        <span class="ry-line-main"><b>${esc(evLabel)}${r.deduction_category ? ' · ' + esc(RY_CAT_TE[r.deduction_category] || r.deduction_category) : ''}</b>
+          <small>${esc(timeOf(r.created_at))}</small></span>
+        <b class="ry-amt">${esc(fmtINR(r.amount))}</b>
+        <button class="rev" type="button" data-rev-tx="${esc(r.id)}" aria-label="రద్దు చేయండి">⟲</button>
+      </div>`);
+    }
+  };
+  push(s.advances, 'అడ్వాన్స్');
+  push(s.deductions, 'తగ్గింపు');
+  push(s.payments, 'చెల్లింపు');
+  return `
+  <div class="settle-card">
+    <div class="sc-head">
+      <b>${esc(PROD_TE[s.produce] || s.produce || '—')}</b>
+      <span class="sc-qty">${esc(String(s.quantity != null ? s.quantity : '?'))} ${esc(ryUnitTe(s.unit))} × ₹${esc(String(s.rate != null ? s.rate : '?'))}</span>
+      ${badge}
+      <button class="rev" type="button" data-rev-tx="${esc(s.settlement_id)}" aria-label="రద్దు చేయండి">⟲</button>
+    </div>
+    ${rows.length ? `<div class="sc-rows">${rows.join('')}</div>` : '<div class="sc-rows muted-small">ఈ సెటిల్‌మెంట్‌కు అనుబంధ నమోదులు లేవు</div>'}
+    <div class="sc-tot">
+      <span>మొత్తం ₹${esc(fmtINR(s.gross))}</span>
+      <span>అడ్వాన్స్ ₹${esc(fmtINR(s.advance_total || 0))}</span>
+      <span>తగ్గింపు ₹${esc(fmtINR(s.deduction_total || 0))}</span>
+      <span>చెల్లింపు ₹${esc(fmtINR(s.payment_total || 0))}</span>
+      <span class="sc-rem">మిగిలింది <b>${esc(fmtINR(s.remaining))}</b></span>
+    </div>
+  </div>`;
+}
+// shared reverse card (rythu farmer screen)
+function ryReverseCard(txId, onDone) {
+  let rc = $('#revCard');
+  if (rc) rc.remove();
+  rc = document.createElement('div');
+  rc.id = 'revCard';
+  rc.className = 'card rev-card';
+  rc.innerHTML = `
+    <div class="q-title">నమోదును రద్దు చేయండి · Reverse this entry</div>
+    <label class="field" for="revReason">కారణం · Reason</label>
+    <input id="revReason" class="input" maxlength="200" placeholder="తప్పు మొత్తం · wrong amount">
+    <div class="confirm-actions">
+      <button id="revOk" class="btn primary" type="button">⟲ రద్దు చేయండి</button>
+      <button id="revNo" class="btn ghost" type="button">❌ వదులుకోండి</button>
+    </div>
+    <div id="revErr" class="err" hidden></div>`;
+  const list = $('#rySettleList');
+  if (list) list.after(rc);
+  else appEl().appendChild(rc);
+  $('#revReason').focus();
+  $('#revNo').onclick = () => rc.remove();
+  $('#revOk').onclick = async () => {
+    const reason = $('#revReason').value.trim();
+    if (!reason) return showErr($('#revErr'), 'రద్దు కారణం తప్పనిసరి · reason required');
+    const btn = $('#revOk');
+    btn.disabled = true;
+    try {
+      await api('/api/transactions/' + txId + '/reverse', { method: 'POST', body: { reason } });
+      rc.remove();
+      speak('రద్దు చేశాను. · reversed');
+      await onDone();
+    } catch (e) {
+      if (e.status === 401) return goLogin();
+      showErr($('#revErr'), e.message);
+      btn.disabled = false;
+    }
+  };
 }
 
 // ================= #/dashboard, #/reports (placeholders) =================
