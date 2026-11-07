@@ -8,9 +8,11 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { createClient } = require('@supabase/supabase-js');
-const { requestId, securityHeaders, sameOrigin, contentLength, errorHandler, validateJwtSecret } = require('./security.js');
+const QRCode = require('qrcode'); // SVG QR generation for acknowledgement links
+const { requestId, securityHeaders, sameOrigin, contentLength, errorHandler, validateJwtSecret, redactAckToken } = require('./security.js');
 const money = require('./lib/money');
 const ledger = require('./lib/ledger');
+const ack = require('./lib/ack');
 const parseVoice = require('./public/parser');     // rule-based parse() (+ parseVoice.diagnose)
 const resolveName = require('./public/resolver');  // name matcher, shared with the browser
 const parseRythu = require('./public/rythu-parser'); // rythu events (+ parseRythu.diagnose)
@@ -21,6 +23,10 @@ const E = process.env;
 const PORT = E.PORT || 3000;
 const PROD = E.NODE_ENV === 'production';
 const JWT_SECRET = E.JWT_SECRET;
+// APP_ORIGIN: the canonical public origin used to build customer-facing
+// acknowledgement link URLs (comma list; the first entry wins, the rest are
+// extra allowed Origins for the sameOrigin CSRF check)
+const APP_ORIGIN = String(E.APP_ORIGIN || '').split(',').map(s => s.trim()).filter(Boolean)[0] || '';
 
 // ---- config checks (never print secret values) ----
 // weak/placeholder secrets are fatal only in production; dev just warns
@@ -47,6 +53,8 @@ const db = () => {
 };
 // the ledger module talks to Supabase through this single injected client
 ledger.setClient(sb);
+// acknowledgements share the same injected client (tests swap both for fakes)
+ack.setClient(sb);
 
 // shared LedgerError/MoneyError responder: machine code -> status, Telugu message
 // to the caller, only the category to the server log (never amounts/names/phones)
@@ -55,8 +63,10 @@ function ledgerFail(res, e, ctx) {
   const status = {
     OVERPAYMENT: 409, ALREADY_REVERSED: 409, CONFLICT: 409,
     HAS_LINKED_ROWS: 409, SETTLEMENT_REQUIRED: 409, KIND_MISMATCH: 409,
+    NOT_DISPUTED: 409,
     NOT_FOUND: 404, NOT_OWNED: 404,
-    NOT_REVERSIBLE: 400, BAD_REQUEST: 400, NO_LEDGER: 500,
+    NOT_REVERSIBLE: 400, BAD_REQUEST: 400, ACK_BAD_STATE: 400, ACK_NOT_ALLOWED: 400,
+    NO_LEDGER: 500,
   }[(e && e.code)] || 0;
   const final = status || 500; // unmapped -> 500 (and it must still be logged)
   if (final >= 500) {
@@ -164,6 +174,13 @@ const ttsApiLimiter = rateLimit({
   windowMs: 60 * 1000, limit: 60, standardHeaders: true, legacyHeaders: false, message: rlMsg,
   keyGenerator: req => `${ipKeyGenerator(req.ip)}|${(req.shop && req.shop.id) || 'anon'}`,
 });
+// public acknowledgement endpoints: 30/min per IP. The customer's browser only
+// ever needs one POST, so this stays well inside normal use while a scripted
+// stranger gets shut out.
+const ackPublicLimiter = rateLimit({
+  windowMs: 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false, message: rlMsg,
+  keyGenerator: req => ipKeyGenerator(req.ip),
+});
 
 // ---- Gnani TTS (same call the /api/tts route uses) ----
 // Explicit upstream timeouts; failures are returned as a kind + status only —
@@ -235,6 +252,70 @@ async function sentenceAudio(text) {
     } catch (_) {}
   }
   return out;
+}
+
+// ---- Sprint 3: acknowledgement audio pre-generation ----
+// ONE Telugu summary is synthesized at link-creation time and cached on disk
+// as data/tts-cache/ack-<sha256.hex>.wav — keyed by the TOKEN HASH (the raw
+// token never becomes a file name and the summary text is never stored; the
+// file name is a hash, exactly like every other cache entry). A TTS failure
+// only means the link has no audio; the link itself is unaffected.
+async function pregenAckAudio(tokenHash, text) {
+  const file = path.join(CACHE_DIR, 'ack-' + tokenHash + '.wav');
+  if (fs.existsSync(file)) return true;
+  const out = await gnaniTts(text);
+  if (!out.ok) {
+    console.error('[ack-audio] id=- tts=' + (out.kind || out.status || 'fail')); // kind only, no text
+    return false;
+  }
+  try {
+    const tmp = file + '.' + process.pid + '.tmp';
+    fs.writeFileSync(tmp, out.buffer);
+    fs.renameSync(tmp, file);
+    return true;
+  } catch (_) { return true; } // write failure must not fail the link
+}
+
+// small server-side digits->Telugu words for the spoken summary (the TTS
+// provider reads digit runs badly, same reason the browser telemetry spells
+// numbers as words before sending them)
+const ACK_TE_NUM = ['సున్నా', 'ఒకటి', 'రెండు', 'మూడు', 'నాలుగు', 'ఐదు', 'ఆరు', 'ఏడు', 'ఎనిమిది', 'తొమ్మిది'];
+const ACK_TE_TEEN = ['పది', 'పదకొండు', 'పన్నెండు', 'పదమూడు', 'పద్నాలుగు', 'పదిహేను', 'పదహారు', 'పదిఏడు', 'పద్దెనిమిది', 'పందొమ్మది'];
+const ACK_TE_TENS = { 2: 'ఇరవై', 3: 'ముప్పై', 4: 'నలభై', 5: 'యాభై', 6: 'అరవై', 7: 'డెభై', 8: 'ఎనభై', 9: 'తొంభై' };
+function teWords(n) {
+  n = Math.round(Number(n) || 0);
+  if (n < 0) return 'మైనస్ ' + teWords(-n);
+  if (n < 10) return ACK_TE_NUM[n];
+  if (n < 20) return ACK_TE_TEEN[n - 10];
+  if (n < 100) return ACK_TE_TENS[Math.floor(n / 10)] + (n % 10 ? ' ' + ACK_TE_NUM[n % 10] : '');
+  if (n < 1000) return ACK_TE_NUM[Math.floor(n / 100)] + ' వందల' + (n % 100 ? ' ' + teWords(n % 100) : '');
+  if (n < 100000) return teWords(Math.floor(n / 1000)) + ' వేల' + (n % 1000 ? ' ' + teWords(n % 1000) : '');
+  if (n < 10000000) return teWords(Math.floor(n / 100000)) + ' లక్షల' + (n % 100000 ? ' ' + teWords(n % 100000) : '');
+  return teWords(Math.floor(n / 10000000)) + ' కోట్ల' + (n % 10000000 ? ' ' + teWords(n % 10000000) : '');
+}
+const ACK_UNIT_PL = { quintal: 'క్వింటాళ్ల', kg: 'కిలోలు', tonne: 'టన్నులు', bag: 'బస్తాలు' };
+const ACK_PRODUCE_TE = {
+  paddy: 'వరి', cotton: 'పత్తి', chilli: 'మిరప', maize: 'మొక్కజొన్న',
+  bengal_gram: 'శనగ', red_gram: 'కంది', green_gram: 'పెసర',
+  black_gram: 'మినుము', groundnut: 'వేరుశనగ', turmeric: 'పసుపు',
+  sesame: 'నువ్వులు', jowar: 'జొన్న',
+};
+// spoken summary of the entry: "<shop>: <what> <amount> రూపాయలు"
+function ackSpokenText(tx, shopName) {
+  const shop = String(shopName || 'దుకాణం') + ': ';
+  if (tx.event === 'produce_delivery') {
+    const q = tx.quantity != null ? teWords(Number(tx.quantity)) + ' ' + (ACK_UNIT_PL[tx.unit] || tx.unit || '') : '';
+    const prod = ACK_PRODUCE_TE[(tx.produce || '').toLowerCase()] || (tx.produce || '');
+    return shop + q + ' ' + prod + ' అందింది. మొత్తం ' + teWords(tx.amount) + ' రూపాయలు.';
+  }
+  return shop + 'తీసుకున్న ఉద్దెర ' + teWords(tx.amount) + ' రూపాయలు.';
+}
+// on-screen (non-TTS) summary used in the WhatsApp share message
+function ackSummaryText(tx) {
+  if (tx.event === 'produce_delivery') {
+    return `${tx.quantity != null ? tx.quantity : '?'} ${tx.unit || ''} ${ACK_PRODUCE_TE[(tx.produce || '').toLowerCase()] || tx.produce || ''}`.trim();
+  }
+  return 'ఉద్దెర';
 }
 
 // ---- Telugu kirana word bank (voice-word check) ----
@@ -385,6 +466,101 @@ app.post('/api/auth/logout', (req, res) => { clearSession(res); res.json({ ok: t
 // ---- health probe (Render): no auth, returns a constant only — no secrets ----
 app.get('/healthz', (req, res) => res.json({ ok: true }));
 
+// ---------------------------------------------------------------------------
+// Sprint 3 — PUBLIC customer-acknowledgement endpoints (no auth, NO COOKIES:
+// nothing here reads or sets a session).
+// These live OUTSIDE the requireAuth/cookie machinery but INSIDE the same
+// security.js chain: identical CSP, nosniff, frame-deny and the sameOrigin
+// origin/CSRF check on the mutating POST. Every response is noindex and
+// no-store; the token itself is never logged (redactAckToken keeps any URL
+// that reaches a log line secret-free).
+// ---------------------------------------------------------------------------
+const ACK_NO_CACHE = {
+  'Cache-Control': 'no-store',
+  'Referrer-Policy': 'no-referrer',
+  'X-Robots-Tag': 'noindex, nofollow',
+};
+
+// GET /a/:token — the customer-facing page (self-contained: /ack.html + /ack.js
+// + /ack.css, all CSP-safe with no inline scripts/styles/handlers). The token
+// shape is NOT validated here on purpose: an odd URL simply shows the generic
+// not-found state, while browsers get noCancelled red — same page either way.
+app.get('/a/:token', (req, res) => {
+  res.set(ACK_NO_CACHE);
+  console.log('[ack] page id=' + req.id + ' path=' + redactAckToken(req.originalUrl));
+  res.sendFile(path.join(__dirname, 'public', 'ack.html'));
+});
+
+// GET /a/:token/audio — the pre-generated summary wav, only for a VALID,
+// ACTIVE (awaiting, unexpired) token.
+app.get('/a/:token/audio', async (req, res) => {
+  res.set(ACK_NO_CACHE);
+  try {
+    const v = await ack.viewByToken(String(req.params.token));
+    if (!v || v.status !== 'awaiting') {
+      // expired / revoked / unknown / already answered: one generic sound-less 404
+      return res.status(404).json({ error: ack.GENERIC_404, code: 'NOT_FOUND' });
+    }
+    const file = path.join(CACHE_DIR, 'ack-' + v.ack.token_hash + '.wav');
+    if (!fs.existsSync(file)) return res.status(404).json({ error: 'ఆడియో లేదు · no audio', code: 'NO_AUDIO' });
+    res.type('audio/wav').send(fs.readFileSync(file));
+  } catch (e) {
+    console.error('[ack] audio id=' + req.id + ' err=' + ((e && e.code) || 'ERROR'));
+    res.status(500).json({ error: 'సర్వర్ సమస్య, మళ్లీ ప్రయత్నించండి' });
+  }
+});
+
+// GET /api/public/ack/:token — the JSON the page renders. Shows ONLY: shop
+// name, entry date, what happened, amount, item details, response state.
+// NEVER: other entries, balances, phone numbers or the shop address.
+app.get('/api/public/ack/:token', async (req, res) => {
+  res.set(ACK_NO_CACHE);
+  try {
+    const v = await ack.viewByToken(String(req.params.token));
+    if (!v) return res.status(404).json({ error: ack.GENERIC_404, code: 'NOT_FOUND', status: 'not_found' });
+    if (v.status === 'expired') {
+      return res.status(404).json({ error: 'లింక్ గడువు ముగిసింది · link expired', code: 'ACK_EXPIRED', status: 'expired' });
+    }
+    // shop name by the ACK's own shop_id (cancelled links have no tx to read)
+    const shopRows = await db().from('shops').select('shop_name')
+      .eq('id', (v.tx && v.tx.shop_id) || v.ack.shop_id).limit(1);
+    if (shopRows && shopRows.error) throw shopRows.error;
+    const shopName = ((shopRows.data || [])[0] || {}).shop_name || '';
+    const view = ack.publicView(v.status, v.ack, v.tx, shopName);
+    // audio availability for the awaiting page: does the cache file exist?
+    if (v.status === 'awaiting') {
+      view.audio = fs.existsSync(path.join(CACHE_DIR, 'ack-' + v.ack.token_hash + '.wav'));
+    } else {
+      view.audio = false; // a responded/cancelled link never plays the summary
+    }
+    return res.json(view);
+  } catch (e) {
+    console.error('[ack] view id=' + req.id + ' err=' + ((e && e.code) || 'ERROR'));
+    return res.status(500).json({ error: 'సర్వర్ సమస్య, మళ్లీ ప్రయత్నించండి' });
+  }
+});
+
+// POST /api/public/ack/:token — THE customer's single response
+// { action: 'acknowledge' | 'dispute', note? }. Single-response rule: the
+// first answer wins and any repeat returns the SAME status; unknown/expired/
+// revoked tokens read as the same generic 404. 30/min per IP; the sameOrigin
+// guard upstream covers CSRF; the audit row records NO ip and NO token.
+app.post('/api/public/ack/:token', ackPublicLimiter, async (req, res) => {
+  const b = req.body || {};
+  const action = b.action === 'dispute' ? 'dispute' : b.action === 'acknowledge' ? 'acknowledge' : null;
+  if (!action) return res.status(400).json({ error: 'చర్య సరిలేదు · unknown action', code: 'BAD_ACTION' });
+  try {
+    const out = await ack.respond(String(req.params.token), action,
+      typeof b.note === 'string' ? b.note : '');
+    if (out.code === 'NOT_FOUND') return res.status(404).json({ error: ack.GENERIC_404, code: 'NOT_FOUND' });
+    console.log('[ack] respond id=' + req.id + ' result=' + out.status + (out.repeat ? ' repeat' : ''));
+    return res.json({ ok: true, status: out.status, repeat: !!out.repeat });
+  } catch (e) {
+    console.error('[ack] respond id=' + req.id + ' err=' + ((e && e.code) || 'ERROR'));
+    return res.status(500).json({ error: 'సర్వర్ సమస్య, మళ్లీ ప్రయత్నించండి' });
+  }
+});
+
 // ---- requireAuth: every /api route except /api/auth/* ----
 function requireAuth(req, res, next) {
   const token = req.signedCookies && req.signedCookies.session;
@@ -513,7 +689,7 @@ app.get('/api/customers', async (req, res) => {
     const [c, t] = await Promise.all([
       db().from('customers').select('id, name, label, phone, aliases, kind, village, created_at')
         .eq('shop_id', req.shop.id).order('name', { ascending: true }),
-      db().from('transactions').select('customer_id, type, amount, created_at')
+      db().from('transactions').select('customer_id, type, amount, created_at, status, ack_status')
         .eq('shop_id', req.shop.id),
     ]);
     if (c.error) throw c.error;
@@ -523,6 +699,8 @@ app.get('/api/customers', async (req, res) => {
     for (const tx of (t.data || [])) {
       const cust = map.get(tx.customer_id);
       if (!cust) continue;
+      // disputed-entry badge feed: any LIVE disputed entry on the account
+      if (tx.ack_status === 'disputed' && tx.status === 'posted') cust.disputed = true;
       const amt = Number(tx.amount) || 0;
       cust.balance += tx.type === 'credit' ? amt : -amt; // balance = credit - pay
       if (!cust.last_activity || new Date(tx.created_at) > new Date(cust.last_activity)) cust.last_activity = tx.created_at;
@@ -884,7 +1062,7 @@ app.get('/api/customers/:id/transactions', async (req, res) => {
     const c = await ownCustomer(req, req.params.id);
     if (!c) return res.status(404).json({ error: 'కస్టమర్ దొరకలేదు' });
     const { data, error } = await db().from('transactions')
-      .select('id, customer_id, type, amount, raw_transcript, created_at, event, workflow, direction, status, reverses_id, reason')
+      .select('id, customer_id, type, amount, raw_transcript, created_at, event, workflow, direction, status, reverses_id, reason, ack_status')
       .eq('shop_id', req.shop.id).eq('customer_id', c.id)
       .order('created_at', { ascending: false });
     if (error) throw error;
@@ -986,6 +1164,70 @@ app.post('/api/transactions/:id/allocate', async (req, res) => {
   try {
     res.json(await ledger.allocateToSettlement(req.shop.id, String(req.params.id), String(settlementId)));
   } catch (e) { ledgerFail(res, e, 'transactions/allocate'); }
+});
+
+// ---------------------------------------------------------------------------
+// Sprint 3 — shop-facing acknowledgement routes (requireAuth + shop-scoped).
+// ack_status is a DB-guarded column (migration 003 trigger): the ONLY writers
+// are ack-link (awaiting), the public response route (acknowledged/disputed),
+// ack-resolve (resolved) and the reversal path (cancelled).
+// ---------------------------------------------------------------------------
+
+// POST /api/transactions/:id/ack-link — mint a fresh acknowledgement link for
+// a credit row (goods_credit / produce_delivery only). Any previous ACTIVE
+// link for the entry is revoked first; the response carries the raw token
+// exactly ONCE. A Telugu summary is pre-synthesized (best-effort) into the
+// disk cache keyed by the token hash.
+app.post('/api/transactions/:id/ack-link', async (req, res) => {
+  try {
+    const { token, hash, tx } = await ack.createLink(req.shop.id, String(req.params.id));
+    // the shareable URL: APP_ORIGIN first, fall back to the request's own host
+    const origin = APP_ORIGIN || req.protocol + '://' + req.get('Host');
+    const url = origin.replace(/\/+$/, '') + '/a/' + token;
+    // pre-generate ONE Telugu audio of the entry summary, cached by the hash
+    let shopName = '';
+    try {
+      const s = await db().from('shops').select('shop_name').eq('id', req.shop.id).limit(1);
+      if (s && s.error) throw s.error;
+      shopName = ((s.data || [])[0] || {}).shop_name || '';
+    } catch (_) { /* shop name is cosmetic in the spoken summary */ }
+    const audio = await pregenAckAudio(hash, ackSpokenText(tx, shopName));
+    // QR is generated server-side; its encoded payload is exactly the URL
+    const qrSvg = await QRCode.toString(url, {
+      type: 'svg', margin: 1, errorCorrectionLevel: 'M', width: 512,
+    });
+    res.json({ url, qrSvg, audio });
+  } catch (e) { ledgerFail(res, e, 'ack/link'); }
+});
+
+// POST /api/transactions/:id/ack-resolve { note? } — the SHOP closes a
+// disputed acknowledgement as resolved (ack_status becomes 'resolved').
+// Audited. The optional note is accepted for API clarity but has no storage
+// column — the customer's dispute_note stays untouched.
+app.post('/api/transactions/:id/ack-resolve', async (req, res) => {
+  const note = String(((req.body || {}).note) == null ? '' : req.body.note).trim();
+  if (note.length > 200) return res.status(400).json({ error: 'సందేశం చాలా పొడవు · note too long' });
+  try {
+    res.json(await ack.resolveDispute(req.shop.id, String(req.params.id)));
+  } catch (e) { ledgerFail(res, e, 'ack/resolve'); }
+});
+
+// GET /api/acknowledgements/summary — counts of awaiting / acknowledged /
+// disputed for this shop (dashboard strip).
+app.get('/api/acknowledgements/summary', async (req, res) => {
+  try {
+    res.json(await ack.shopSummary(req.shop.id));
+  } catch (e) { ledgerFail(res, e, 'ack/summary'); }
+});
+
+// GET /api/transactions/:id/ack — the shop reads ONE entry's acknowledgement
+// detail (status + the customer's dispute note; a red chip shows it back)
+app.get('/api/transactions/:id/ack', async (req, res) => {
+  try {
+    const info = await ack.info(req.shop.id, String(req.params.id));
+    if (!info) return res.status(404).json({ error: 'ధృవీకరణ లేదు · no acknowledgement', code: 'NOT_FOUND' });
+    res.json(info);
+  } catch (e) { ledgerFail(res, e, 'ack/get'); }
 });
 
 // ---- startup: log configuration STATE only, never values ----

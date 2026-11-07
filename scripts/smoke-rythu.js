@@ -146,6 +146,135 @@ function stepFail(name, status) {
     const sm = await fetch(BASE + '/api/rythu/summary', { headers: { Cookie: cookie } });
     ok('rythu summary readable without error', sm.ok);
 
+    // ================= sprint 3: acknowledgement flow (kirana) =================
+    // ---- 6. shop profile: the public page shows the SHOP NAME ----
+    const shopName = '__SMOKE shop ' + crypto.randomUUID().slice(0, 8);
+    const prof = await reqJSON('profile-set', 'PUT', '/api/me', {
+      owner_name: '__smoke owner', shop_name: shopName, address: '__smoke address',
+    });
+    if (!prof.res.ok) throw prof.out;
+
+    // ---- 7. a kirana customer + one goods_credit entry ----
+    const kname = '__SMOKE kirana ' + crypto.randomUUID().slice(0, 8);
+    const kc = await reqJSON('create-kirana', 'POST', '/api/customers', { name: kname, kind: 'customer' });
+    if (!kc.res.ok) throw kc.out;
+    const kid = kc.data && (kc.data.id || (kc.data.customer && kc.data.customer.id));
+    if (!kid) throw kc.out;
+    const ke = await reqJSON('credit-post', 'POST', '/api/transactions', {
+      customer_id: kid, workflow: 'kirana', direction: 'receivable', type: 'credit', event: 'goods_credit',
+      amount: 300, note: 'smoke credit note', idempotency_key: crypto.randomUUID(), source: 'screen',
+    });
+    if (!ke.res.ok) throw ke.out;
+    const entryId = ke.data && ke.data.id;
+    ok('credit posted for acknowledgement', !!entryId);
+
+    // payment/debt rows must NEVER get a link (debt side is not acknowledge-able)
+    const kPay = await reqJSON('payment-post-kirana', 'POST', '/api/transactions', {
+      customer_id: kid, workflow: 'kirana', type: 'pay', event: 'repayment', amount: 100,
+      idempotency_key: crypto.randomUUID(), source: 'screen',
+    });
+    if (!kPay.res.ok) throw kPay.out;
+    const badLink = await reqJSON('ack-link-pay-rejected', 'POST',
+      '/api/transactions/' + (kPay.data && kPay.data.id) + '/ack-link', {});
+    if (badLink.res.ok) { console.log('[smoke] ack-link on a payment: MUST have failed'); }
+    ok('ack-link on a payment row rejected', !badLink.res.ok);
+
+    // ---- 8. mint the link: URL + QR svg back, audio best-effort ----
+    const al = await reqJSON('ack-link', 'POST', '/api/transactions/' + entryId + '/ack-link', {});
+    if (!al.res.ok) throw al.out;
+    const link = al.data || {};
+    const url = String(link.url || '');
+    const mTok = /\/a\/([A-Za-z0-9_-]{43})$/.exec(url);
+    ok('ack-link: url ends in /a/<43-char base64url token>', !!mTok);
+    ok('ack-link: qr svg present', String(link.qrSvg || '').indexOf('<svg') === 0);
+    const token1 = mTok ? mTok[1] : '';
+    // the QR payload is exactly the URL — both were built from the same string
+    // server-side (asserted on the shape here; decoding needs raster imaging)
+
+    // ---- 9. the customer opens the page + JSON view (no cookies anywhere) ----
+    const page = await fetch(BASE + '/a/' + token1);
+    const pageOk = page.status === 200 && (await page.text()).indexOf('<html') !== -1;
+    ok('public page loads with browser-guard headers', pageOk &&
+      page.headers.get('cache-control') === 'no-store' &&
+      String(page.headers.get('x-robots-tag') || '').indexOf('noindex') !== -1, page.status);
+    const pj = await fetch(BASE + '/api/public/ack/' + token1);
+    const pv = pj.ok ? await pj.json() : null;
+    ok('public view: awaiting + the shop name', pj.status === 200 && pv &&
+      pv.status === 'awaiting' && pv.shop_name === shopName);
+    ok('public view: minimal field set only', !!pv && Object.keys(pv).every(k =>
+      ['status', 'shop_name', 'entry_date', 'entry_kind', 'amount', 'item',
+        'responded_at', 'dispute_note', 'audio'].includes(k)));
+    ok('public view: leaks no customer name or phone',
+      JSON.stringify(pv || {}).indexOf(kname) === -1);
+    const au = await fetch(BASE + '/a/' + token1 + '/audio');
+    ok('ack audio served (or provider down at mint time)',
+      au.status === 200 || (au.status === 404), au.status);
+
+    // ---- 10. single response: acknowledge once, repeats are idempotent ----
+    const answer = (tok, action, note) => fetch(BASE + '/api/public/ack/' + tok, {
+      method: 'POST', headers: Object.assign({ 'Content-Type': 'application/json' }, { Origin: BASE }),
+      body: JSON.stringify(note === undefined ? { action } : { action, note }),
+    });
+    let r1 = null, r2 = null, r3 = null, pv2 = null;
+    try { r1 = await (await answer(token1, 'acknowledge')).json(); } catch (_) {}
+    try { r2 = await (await answer(token1, 'dispute', 'late attempt')).json(); } catch (_) {}
+    try { r3 = await (await answer(token1, 'acknowledge')).json(); } catch (_) {}
+    ok('customer acknowledges once', r1 && r1.ok === true && r1.status === 'acknowledged' && !r1.repeat, JSON.stringify(r1));
+    ok('a given answer can never flip to dispute', r2 && r2.repeat === true && r2.status === 'acknowledged');
+    ok('second acknowledge is an idempotent repeat', r3 && r3.repeat === true);
+
+    const pj2 = await fetch(BASE + '/api/public/ack/' + token1);
+    try { pv2 = await pj2.json(); } catch (_) {}
+    ok('public view now reads acknowledged, audio stopped',
+      pj2.status === 200 && pv2 && pv2.status === 'acknowledged' && pv2.audio === false);
+
+    // ---- 11. the shop sees it: entry ack_status + summary + audits ----
+    const txl = await fetch(BASE + '/api/customers/' + kid + '/transactions', { headers: { Cookie: cookie } });
+    const rows = txl.ok ? (await txl.json()).transactions || [] : [];
+    const rowAck = (rows || []).find(t => t.id === entryId);
+    ok('shop timeline shows ack_status acknowledged', !!rowAck && rowAck.ack_status === 'acknowledged');
+    const sums = await fetch(BASE + '/api/acknowledgements/summary', { headers: { Cookie: cookie } });
+    const sumsData = sums.ok ? await sums.json() : null;
+    ok('acknowledgement summary counts it under acknowledged',
+      sumsData && sumsData.acknowledged >= 1);
+
+    // ---- 12. dispute + resolve round-trip ----
+    const ke2 = await reqJSON('credit-post-2', 'POST', '/api/transactions', {
+      customer_id: kid, workflow: 'kirana', direction: 'receivable', type: 'credit', event: 'goods_credit',
+      amount: 70, note: 'smoke dispute note', idempotency_key: crypto.randomUUID(), source: 'screen',
+    });
+    if (!ke2.res.ok) throw ke2.out;
+    const entry2Id = ke2.data && ke2.data.id;
+    const al2 = await reqJSON('ack-link-2', 'POST', '/api/transactions/' + entry2Id + '/ack-link', {});
+    if (!al2.res.ok) throw al2.out;
+    const mTok2 = /\/a\/([A-Za-z0-9_-]{43})$/.exec(String(al2.data && al2.data.url || ''));
+    const token2 = mTok2 ? mTok2[1] : '';
+    let d1 = null;
+    try { d1 = await (await answer(token2, 'dispute', 'never received this ' + 'x'.repeat(220))).json(); } catch (_) {}
+    ok('customer disputes with a note', d1 && d1.ok === true && d1.status === 'disputed' && !d1.repeat);
+    let di = null;
+    const dil = await fetch(BASE + '/api/transactions/' + entry2Id + '/ack', { headers: { Cookie: cookie } });
+    try { di = await dil.json(); } catch (_) {}
+    ok('shop reads the dispute note via /ack, capped to 200 chars', di &&
+      di.ack_status === 'disputed' &&
+      ((di.acknowledgement || {}).dispute_note || '').length === 200);
+    const rs = await reqJSON('ack-resolve', 'POST', '/api/transactions/' + entry2Id + '/ack-resolve', { note: 'settled' });
+    if (!rs.res.ok) throw rs.out;
+    const rows2 = await (await fetch(BASE + '/api/customers/' + kid + '/transactions', { headers: { Cookie: cookie } })).json();
+    const row2 = ((rows2 || {}).transactions || []).find(t => t.id === entry2Id);
+    ok('resolved dispute shows ack_status resolved', !!row2 && row2.ack_status === 'resolved');
+
+    // ---- 13. re-minting revokes the previous link ----
+    const al3 = await reqJSON('ack-relink', 'POST', '/api/transactions/' + entryId + '/ack-link', {});
+    if (!al3.res.ok) throw al3.out;
+    const mTok3 = /\/a\/([A-Za-z0-9_-]{43})$/.exec(String(al3.data && al3.data.url || ''));
+    const token3 = mTok3 ? mTok3[1] : '';
+    const dead = await fetch(BASE + '/api/public/ack/' + token1);
+    ok('the OLD link answers the generic 404 after a re-mint', dead.status === 404);
+    const fresh3 = await fetch(BASE + '/api/public/ack/' + token3);
+    const fv = fresh3.ok ? await fresh3.json() : null;
+    ok('the NEW link works and the entry is awaiting again', fresh3.status === 200 && fv && fv.status === 'awaiting');
+
     console.log('\n[smoke] EVERY STEP PASSED — rythu save works against the real server');
   } catch (e) {
     console.log('[smoke] STOPPED at the failing step (status/code above). Cleanup still runs.');
@@ -159,6 +288,7 @@ function stepFail(name, status) {
     };
     try {
       if (realShopId) {
+        await del('acknowledgements', 'acknowledgements', 'shop_id', realShopId); // before transactions (FK)
         await del('audit-events', 'audit_events', 'shop_id', realShopId);
         await del('transactions', 'transactions', 'shop_id', realShopId); // one statement: self-ref FK checked at statement end
         await del('customers', 'customers', 'shop_id', realShopId);

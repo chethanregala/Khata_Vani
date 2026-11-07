@@ -1,0 +1,97 @@
+/* ack.css — customer-facing acknowledgement page. Standalone and CSP-safe:
+   every style lives here, no inline style attributes, no inline scripts. */
+:root {
+  --green: #0a7d4b;
+  --green-dark: #06623a;
+  --amber: #b45309;
+  --red: #b91c1c;
+  --ink: #1c1917;
+  --muted: #6b7280;
+  --line: #e5e3df;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  font-family: 'Noto Sans Telugu', system-ui, sans-serif;
+  background: #f4f2ee;
+  color: var(--ink);
+  -webkit-text-size-adjust: 100%;
+}
+.page {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+}
+.ack-box {
+  width: 100%;
+  max-width: 420px;
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  padding: 20px 18px 14px;
+  text-align: center;
+  box-shadow: 0 6px 24px rgba(20, 40, 30, 0.08);
+}
+.ack-brand { color: var(--muted); font-size: 13px; margin: 0 0 14px; }
+.ack-shop { font-size: 20px; font-weight: 700; margin: 2px 0 2px; }
+.ack-kind { color: var(--muted); font-size: 14px; margin: 0; }
+.ack-amount { font-size: 40px; font-weight: 700; margin: 10px 0 4px; }
+.ack-item { font-size: 16px; margin: 2px 0; }
+.ack-date { color: var(--muted); font-size: 13px; margin: 6px 0 0; }
+.ack-note {
+  text-align: right;
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  color: var(--red);
+  border-radius: 12px;
+  padding: 8px 10px;
+  font-size: 14px;
+  margin: 10px 0 0;
+}
+.ack-state { font-weight: 600; font-size: 17px; margin: 14px 0 4px; }
+.ack-actions { margin-top: 16px; display: grid; gap: 10px; }
+.ack-btn {
+  width: 100%;
+  min-height: 56px;
+  font: inherit;
+  font-weight: 700;
+  font-size: 18px;
+  line-height: 1.25;
+  border: 0;
+  border-radius: 14px;
+  cursor: pointer;
+  color: #fff;
+  display: grid;
+  gap: 1px;
+  padding: 10px 12px;
+}
+.ack-btn small { font-weight: 500; font-size: 13px; opacity: 0.85; }
+.ack-btn:disabled { opacity: 0.55; cursor: default; }
+.ack-btn.yes { background: var(--green); }
+.ack-btn.warn { background: var(--amber); }
+.ack-btn.audio { background: #3f4b5b; }
+.ack-btn.plain { background: #ece9e2; color: var(--ink); }
+.ack-btn.small { min-height: 44px; font-size: 15px; }
+.dispute-form { margin-top: 14px; text-align: right; display: grid; gap: 8px; }
+.dispute-form label { font-size: 14px; font-weight: 600; }
+.dispute-form textarea {
+  font: inherit;
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 10px;
+  min-height: 84px;
+  resize: vertical;
+}
+.dispute-actions { display: grid; gap: 8px; }
+.ack-err { color: var(--red); font-size: 14px; margin: 10px 0 0; }
+.ack-sent { color: var(--green-dark); font-size: 14px; margin: 10px 0 0; }
+.ack-foot {
+  color: var(--muted);
+  font-size: 12px;
+  margin: 16px 0 0;
+  border-top: 1px solid var(--line);
+  padding-top: 10px;
+}

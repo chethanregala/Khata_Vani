@@ -502,6 +502,52 @@ h2.section { font-size: 15px; font-weight: 600; color: var(--muted); margin: 22p
 .badge.open { background: var(--green-soft); color: var(--green-dark); }
 .badge.settled { background: #eef0f2; color: var(--muted); }
 .btn.small { min-height: 40px; padding: 6px 12px; font-size: 13.5px; }
-.rev { min-width: 48px; min-height: 48px; font-size: 18px; background: none; border: 0; cursor: pointer; color: var(--muted); }
-.settle-note { margin-top: 6px; }
-.settle-note .btn { min-height: 48px; width: 100%; }
+/* ================= sprint 3: acknowledgements ================= */
+.ack-chip {
+  display: inline-block; font-size: 12px; font-weight: 700;
+  padding: 4px 10px; border-radius: 999px; white-space: nowrap;
+}
+.ack-chip.awaiting { background: var(--amber-soft); color: var(--amber); }
+.ack-chip.ok { background: var(--green-soft); color: var(--green-dark); }
+.ack-chip.disputed { background: var(--red-soft); color: var(--red); cursor: pointer; }
+.ack-chip.cancelled { background: #eef0f2; color: var(--muted); }
+.ack-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+
+.badge.dispute { background: var(--red-soft); color: var(--red); }
+
+.ack-send {
+  background: var(--green-soft); color: var(--green-dark);
+  border: 0; border-radius: 12px; cursor: pointer;
+}
+.ack-send:active { background: #cfe9db; }
+
+.sheet .qr-wrap { margin: 10px auto 6px; display: flex; justify-content: center; }
+.sheet .qr-wrap svg { width: 260px; height: 260px; }
+.ack-link-line { margin: 6px 0; }
+.ack-link-line .ack-url {
+  display: block; font-size: 13.5px; color: var(--muted);
+  background: #fafafa; border: 1px solid var(--line); border-radius: 10px;
+  padding: 8px 10px; overflow-wrap: anywhere; text-align: left;
+}
+.ack-actions { display: flex; gap: 10px; margin-top: 6px; }
+.ack-actions .btn { flex: 1; min-height: 52px; }
+.ack-foot {
+  font-size: 12.5px; color: var(--muted); margin: 12px 0 2px; text-align: center;
+}
+.disp-note {
+  background: var(--red-soft); color: var(--red); border-radius: 10px;
+  padding: 10px 12px; margin: 8px 0; font-size: 15px; text-align: left;
+}
+
+/* dashboard (replaces the old "coming soon" reports placeholder) */
+.dash-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.dash-card { text-align: left; }
+.dash-ack-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.dash-ack-row .ack-chip { cursor: default; }
+.dash-ack-row .ack-chip[data-ack-resolve] { cursor: pointer; }
+.dash-rank {
+  width: 26px; height: 26px; flex: 0 0 26px; border-radius: 50%;
+  background: var(--green-soft); color: var(--green-dark);
+  font-size: 13px; font-weight: 700; display: inline-flex;
+  align-items: center; justify-content: center;
+}

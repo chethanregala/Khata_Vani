@@ -72,7 +72,6 @@ function route() {
   if (view.startsWith('#/customer/')) return viewCustomer(decodeURIComponent(view.slice('#/customer/'.length)));
   if (view === '#/customers') return viewCustomers();
   if (view === '#/dashboard') return viewDashboard();
-  if (view === '#/reports') return viewReports();
   if (view === '#/login') return viewLogin();
   if (view === '#/verify') return viewVerify();
   if (view === '#/profile') return viewProfile();
@@ -428,7 +427,6 @@ function tabbar(active) {
     ['#/home', '🎤', 'హోమ్', 'Home'],
     ['#/customers', '👥', 'కస్టమర్లు', 'Customers'],
     ['#/dashboard', '📊', 'డాష్‌బోర్డ్', 'Dashboard'],
-    ['#/reports', '📋', 'రిపోర్ట్లు', 'Reports'],
   ];
   return `<nav class="tabbar" aria-label="మెను">${tabs.map(([href, ic, te, en]) => `
     <a class="tab${active === href ? ' on' : ''}" href="${href}">
@@ -1451,6 +1449,7 @@ function renderCustomers() {
         <span class="cust-name">${esc(c.name)}${c.label ? ` <em>${esc(c.label)}</em>` : ''}</span>
         <span class="cust-act">${esc(relTime(c.last_activity))}</span>
         ${isOverdue(c) ? '<span class="badge overdue">30+ రోజుల ఆలస్యం · Overdue 30+ days</span>' : ''}
+        ${c.disputed ? '<span class="badge dispute">⚠️ వివాదం · Disputed entry</span>' : ''}
       </span>
       <span class="cust-right">
         <b class="bal ${c.balance > 0 ? 'owed' : ''}">${esc(fmtINR(c.balance || 0))}</b>
@@ -1530,6 +1529,7 @@ async function viewCustomer(id) {
       <div id="mgErr" class="err" hidden></div>
     </div>
     <h2 class="section">లావాదేవీలు · Transactions</h2>
+    ${ACK_FOOTNOTE}
     <div id="timeline">${skelRows(3)}</div>
     <div id="derr" class="err" hidden></div>
   </main>
@@ -1642,6 +1642,7 @@ async function loadTimeline(id) {
   el.innerHTML = r.transactions.map(t => {
     const reversed = t.status === 'reversed';
     const isRev = t.event === 'reversal';
+    const ackable = !isRev && !reversed && ACKABLE_EVENT(t);
     const sign = t.type === 'credit' ? '+' : '−';
     const em = isRev ? 'రద్దు చేసింది · reversal' : (t.type === 'credit' ? 'ఉద్దెర' : 'జమ');
     const head = isRev
@@ -1655,10 +1656,20 @@ async function loadTimeline(id) {
         <small>${esc(timeOf(t.created_at))}${!isRev && t.raw_transcript ? ' · “' + esc(String(t.raw_transcript).slice(0, 60)) + '”' : ''}${t.reason ? ' · ' + esc(String(t.reason).slice(0, 80)) : ''}</small>
         ${reversed ? '<small class="rev-note">రద్దు చేయబడింది · reversed</small>' : ''}
       </span>
+      <span class="ack-chips">${ackChipHtml(t.ack_status, t.id)}</span>
+      ${ackable ? `<button class="rev ack-send" type="button" data-ack-tx="${esc(t.id)}" aria-label="ధృవీకరణకు పంపు · Send for acknowledgement">📨</button>` : ''}
       ${(!isRev && !reversed) ? `<button class="rev" type="button" data-rev-tx="${esc(t.id)}" aria-label="రద్దు చేయండి">⟲</button>` : ''}
     </div>`;
   }).join('');
   closeRevCard();
+  // acknowledgement actions: 📨 opens the link/QR sheet; a disputed chip opens
+  // the resolve card (note shown back to the shopkeeper)
+  wireAckActions(el,
+    ackTx => {
+      const t = r.transactions.find(x => x.id === ackTx);
+      if (t) sendAckForEntry(t, r.customer, () => { try { loadTimeline(id); } catch (_) {} }, $('#derr'));
+    },
+    () => { try { loadTimeline(id); } catch (_) {} });
   el.querySelectorAll('[data-rev-tx]').forEach(b => {
     b.onclick = () => {
       closeRevCard();
@@ -1878,7 +1889,8 @@ function renderRythuFarmers() {
     <div class="ry-farmer-card" data-ry-open="${esc(f.id)}" role="button" tabindex="0">
       <span class="avatar av-${hashOf(f.id) % 6}">${esc(initialsOf(f.name))}</span>
       <span class="tx-main"><b>${esc(f.name)}${f.village ? ` <em>${esc(f.village)}</em>` : ''}</b>
-        <small>${f.open_settlements ? `${f.open_settlements} సెటిల్‌మెంట్లు ఓపెన్` : 'ఓపెన్ సెటిల్‌మెంట్ లేదు'}</small></span>
+        <small>${f.open_settlements ? `${f.open_settlements} సెటిల్‌మెంట్లు ఓపెన్` : 'ఓపెన్ సెటిల్‌మెంట్ లేదు'}</small>
+        ${f.disputed ? '<span class="badge dispute">⚠️ వివాదం · Disputed entry</span>' : ''}</span>
       <span class="tx-amt ${Number(f.payable) > 0 ? 'owed' : 'paid'}">${Number(f.payable) > 0
         ? esc(fmtINR(f.payable)) : esc(fmtINR(-(f.advance || 0)))}</span>
     </div>`).join('');
@@ -2621,6 +2633,7 @@ async function viewRythuFarmer(id) {
     </div>
     <div id="ryForm" class="card" hidden></div>
     <h2 class="section">సెటిల్‌మెంట్లు · Settlements</h2>
+    ${ACK_FOOTNOTE}
     <div id="rySettleList">${skelRows(2)}</div>
     ${(d.unallocated || []).length ? `<h2 class="section">అనుబంధం లేని నమోదులు · Unallocated</h2>
     <div id="ryUnalloc"></div>` : ''}
@@ -2761,6 +2774,16 @@ async function viewRythuFarmer(id) {
     } else {
       box.innerHTML = dd.settlements.map(s => rySettleCard(s)).join('');
       box.querySelectorAll('[data-rev-tx]').forEach(b => { b.onclick = () => ryReverseCard(b.dataset.revTx, () => viewRythuFarmer(id)); });
+      // acknowledgement actions on the delivery rows themselves
+      wireAckActions(box,
+        ackTx => {
+          const s = (dd.settlements || []).find(x => x.settlement_id === ackTx);
+          if (s) sendAckForEntry({
+            id: s.settlement_id, amount: s.gross, event: 'produce_delivery',
+            produce: s.produce, quantity: s.quantity, unit: s.unit,
+          }, dd.customer, () => { try { viewRythuFarmer(id); } catch (_) {} }, $('#ryerr'));
+        },
+        () => { try { viewRythuFarmer(id); } catch (_) {} });
     }
     const ub = $('#ryUnalloc');
     if (ub && (dd.unallocated || []).length) {
@@ -2808,12 +2831,19 @@ function rySettleCard(s) {
   push(s.advances, 'అడ్వాన్స్');
   push(s.deductions, 'తగ్గింపు');
   push(s.payments, 'చెల్లింపు');
+  // the delivery row itself carries the acknowledgement chip + send action
+  const ackChip = ackChipHtml(s.ack_status, s.settlement_id);
+  const ackSend = !reversed
+    ? `<button class="rev ack-send" type="button" data-ack-tx="${esc(s.settlement_id)}" aria-label="ధృవీకరణకు పంపు · Send for acknowledgement">📨</button>`
+    : '';
   return `
   <div class="settle-card">
     <div class="sc-head">
       <b>${esc(PROD_TE[s.produce] || s.produce || '—')}</b>
       <span class="sc-qty">${esc(String(s.quantity != null ? s.quantity : '?'))} ${esc(ryUnitTe(s.unit))} × ₹${esc(String(s.rate != null ? s.rate : '?'))}</span>
       ${badge}
+      <span class="ack-chips">${ackChip}</span>
+      ${ackSend}
       <button class="rev" type="button" data-rev-tx="${esc(s.settlement_id)}" aria-label="రద్దు చేయండి">⟲</button>
     </div>
     ${rows.length ? `<div class="sc-rows">${rows.join('')}</div>` : '<div class="sc-rows muted-small">ఈ సెటిల్‌మెంట్‌కు అనుబంధ నమోదులు లేవు</div>'}
@@ -2865,22 +2895,180 @@ function ryReverseCard(txId, onDone) {
   };
 }
 
-// ================= #/dashboard, #/reports (placeholders) =================
-async function viewPlaceholder(hash, icon, te, en, sub) {
+// ================= Sprint 3: acknowledgement UI (shared helpers) =================
+const ACK_FOOTNOTE = '<p class="ack-foot">📨 link ద్వారా ధృవీకరణ · not legal proof</p>';
+// shared entry-summary fragment for the WhatsApp share text
+function ackEntrySummary(e) {
+  if (e.event === 'produce_delivery') {
+    const q = e.quantity != null ? `${e.quantity} ${ryUnitTe(e.unit) || (e.unit || '')}` : '';
+    return `${q} ${PROD_TE[(e.produce || '').toLowerCase()] || (e.produce || '')}`.trim().replace(/\s+/g, ' ');
+  }
+  return 'ఉద్దెర';
+}
+// POSTs the link request (revokes an older link, mints a fresh one) and then
+// opens the share sheet: large QR, copyable link, WhatsApp share
+async function sendAckForEntry(entry, person, onDone, errEl) {
+  try {
+    const link = await api('/api/transactions/' + encodeURIComponent(entry.id) + '/ack-link', { method: 'POST' });
+    showAckSheet(link, entry, person);
+    if (onDone) onDone();
+  } catch (e) {
+    if (e.status === 401) return goLogin();
+    showErr(errEl || $('#sheetErr') || appEl().querySelector('.err'), e.message || 'లింక్ సాధ్యం కాలేదు');
+  }
+}
+function showAckSheet(link, entry, person) {
+  const shopName = (state.shop && state.shop.shop_name) || 'ఖాతా వాణి';
+  const money = `₹${fmtINR(entry.amount)}`;
+  const msg = `${shopName}: ${money} ${ackEntrySummary(entry)}. దయచేసి ఈ లింక్ లో ధృవీకరించండి: ${link.url}`;
+  let digits = String((person && person.phone) || '').replace(/\D/g, '');
+  if (digits.length === 10 && /^[6-9]/.test(digits)) digits = '91' + digits;
+  const waUrl = 'https://wa.me/' + (digits.length >= 10 ? digits : '') + '?text=' + encodeURIComponent(msg);
+  const sh = showSheet(`
+    <div class="sheet-grab"></div>
+    <div class="sheet-head">
+      <div><h3>ధృవీకరణకు పంపండి</h3><small>Send for acknowledgement · one response per link, 14-day expiry</small></div>
+      <button id="sheetClose" class="sheet-x" type="button" aria-label="మూసివేయండి">✕</button>
+    </div>
+    <div class="qr-wrap">${link.qrSvg}</div>
+    <div class="ack-link-line"><span class="ack-url" id="ackUrlTxt">${esc(link.url)}</span></div>
+    <div class="confirm-actions">
+      <button id="ackCopy" class="btn" type="button">📋 కాపీ · Copy</button>
+      <button id="ackWa" class="btn primary" type="button">🟢 WhatsApp లో పంపండి</button>
+    </div>
+    <p class="ack-foot">link ద్వారా ధృవీకరణ · not legal proof</p>`);
+  sh.querySelector('#sheetClose').onclick = closeChooser;
+  sh.querySelector('#ackCopy').onclick = async () => {
+    const txt = link.url;
+    let ok = false;
+    try { await navigator.clipboard.writeText(txt); ok = true; } catch (_) {}
+    if (!ok) {
+      try {
+        const ta = document.createElement('textarea');
+        ta.value = txt; ta.id = 'ackCopyTa';
+        document.body.appendChild(ta);
+        ta.select(); ok = document.execCommand('copy'); ta.remove();
+      } catch (_) { ok = false; }
+    }
+    say(ok ? 'లింక్ కాపీ అయింది · link copied' : 'కాపీ కాలేదు · copy failed');
+  };
+  sh.querySelector('#ackWa').onclick = () => { window.open(waUrl, '_blank', 'noopener'); };
+}
+// the shop's resolve card for a disputed entry: shows the customer's note and
+// moves the row to 'resolved'
+async function openResolveCard(txnId, listEl, onDone) {
+  let inf = null;
+  try { inf = await api('/api/transactions/' + encodeURIComponent(txnId) + '/ack'); }
+  catch (e) { if (e.status === 401) return goLogin(); return showErr($('#revErr') || $('#derr') || $('#ryerr'), e.message); }
+  const note = inf && inf.acknowledgement && inf.acknowledgement.dispute_note || '';
+  const card = document.createElement('div');
+  card.id = 'revCard';
+  card.className = 'card rev-card';
+  card.innerHTML = `
+    <div class="q-title">వివాదాన్ని పరిష్కరించండి · Resolve dispute</div>
+    ${note ? `<p class="disp-note">⚠️ కస్టమర్ నమోదించిన వివాదం: ${esc(note)}</p>` : '<p class="q-sub">కారణం నమోదు కాలేదు · no note was submitted</p>'}
+    <div class="confirm-actions">
+      <button id="resOk" class="btn primary" type="button">✅ పరిష్కరించినట్టు · Resolve</button>
+      <button id="resNo" class="btn ghost" type="button">❌ వదులుకోండి · Cancel</button>
+    </div>
+    <div id="revErr" class="err" hidden></div>`;
+  if (listEl && listEl.after) listEl.after(card);
+  else appEl().appendChild(card);
+  $('#resNo').onclick = () => card.remove();
+  $('#resOk').onclick = async () => {
+    const btn = $('#resOk');
+    btn.disabled = true;
+    try {
+      await api('/api/transactions/' + encodeURIComponent(txnId) + '/ack-resolve', { method: 'POST', body: { note: 'పరిష్కరించబడింది · resolved' } });
+      card.remove();
+      speak('పరిష్కరించాను. · resolved');
+      if (onDone) await onDone();
+    } catch (e) {
+      if (e.status === 401) return goLogin();
+      showErr($('#revErr'), e.message);
+      btn.disabled = false;
+    }
+  };
+}
+// status chips (Telugu first, colour classes in styles.css); disputed chips
+// carry the transaction id so tapping them opens the resolve card
+function ackChipHtml(ackStatus, txnId) {
+  const s = ackStatus || 'not_required';
+  if (s === 'awaiting') return '<span class="ack-chip awaiting">వేచి ఉంది · Awaiting</span>';
+  if (s === 'acknowledged') return '<span class="ack-chip ok">ధృవీకరించబడింది · Acknowledged via link</span>';
+  if (s === 'disputed') return `<span class="ack-chip disputed" data-ack-resolve data-resolve-tx="${esc(txnId)}">వివాదం · Disputed</span>`;
+  if (s === 'resolved') return '<span class="ack-chip ok">పరిష్కరించబడింది · Resolved</span>';
+  if (s === 'cancelled') return '<span class="ack-chip cancelled">రద్దు · Cancelled</span>';
+  return '';
+}
+const ACKABLE_EVENT = t => t.type === 'credit' &&
+  (t.event === 'goods_credit' || t.event === 'produce_delivery');
+// wires [data-ack-tx] (send link) and [data-ack-resolve] (resolve card) chips —
+// both carry their transaction id in data-resolve-tx style attributes-free data attrs
+function wireAckActions(el, onSend, onResolved) {
+  el.querySelectorAll('[data-ack-tx]').forEach(b => {
+    b.onclick = e => {
+      e.stopPropagation();
+      onSend(b.dataset.ackTx, b);
+    };
+  });
+  el.querySelectorAll('[data-ack-resolve]').forEach(ch => {
+    ch.onclick = e => {
+      e.stopPropagation();
+      const id = ch.dataset.resolveTx;
+      if (id) openResolveCard(id, ch, onResolved);
+    };
+  });
+}
+
+// ================= #/dashboard — minimal numbers, no charts =================
+async function viewDashboard() {
   const shop = await ensureShop();
   if (!shop) return;
   appEl().innerHTML = `
   ${topbar()}
   <main class="screen">
-    <h1 class="screen-title">${esc(te)} <small>${esc(en)}</small></h1>
-    <div class="card coming">
-      <span class="coming-ic">${icon}</span>
-      <b>త్వరలో వస్తోంది · Coming soon</b>
-      <p>${esc(sub)}</p>
+    <h1 class="screen-title">డాష్‌బోర్డ్ <small>Dashboard</small></h1>
+    <div class="dash-grid">
+      <div class="card dash-card"><span class="stat-te">కిరాణాలో తీసుకోవాల్సినవి</span><span class="stat-en">Kirana receivable</span><b class="stat-val owed" id="dshKirana">…</b></div>
+      <div class="card dash-card"><span class="stat-te">రైతులకు చెల్లించాల్సినది</span><span class="stat-en">Rythu payable</span><b class="stat-val paid" id="dshRythuPay">…</b></div>
+      <div class="card dash-card"><span class="stat-te">అడ్వాన్స్ వసూలు</span><span class="stat-en">Advances to recover</span><b class="stat-val owed" id="dshRythuAdv">…</b></div>
+      <div class="card dash-card"><span class="stat-te">ఈ రోజు నమోదులు</span><span class="stat-en">Today's entries</span><b class="stat-val" id="dshToday">…</b></div>
     </div>
+    <div class="card dash-card" id="dshAcks"><span class="stat-te">ధృవీకరణలు</span><span class="stat-en">Acknowledgements</span><div class="dash-ack-row" id="dshAckRow">…</div></div>
+    <div class="card dash-card"><span class="stat-te">ఎక్కువ బాకీ — మొదటి 5</span><span class="stat-en">Top 5 balances</span><div id="dshTop">${skelRows(2)}</div></div>
+    <div id="dsherr" class="err" hidden></div>
   </main>
-  ${tabbar(hash)}`;
+  ${tabbar('#/dashboard')}`;
   wireTopbar();
+  try {
+    const [cust, today, ry, ac] = await Promise.all([
+      api('/api/customers'),
+      api('/api/transactions?date=' + istToday()),
+      api('/api/rythu/summary').catch(() => null),
+      api('/api/acknowledgements/summary').catch(() => null),
+    ]);
+    const kirana = (cust || []).filter(c => (c.kind || 'customer') !== 'farmer');
+    let receive = 0;
+    for (const c of kirana) if (c.balance > 0) receive += Number(c.balance) || 0;
+    $('#dshKirana').textContent = fmtINR(receive);
+    $('#dshRythuPay').textContent = fmtINR((ry && ry.payable_total) || 0);
+    $('#dshRythuAdv').textContent = fmtINR((ry && ry.advance_to_recover) || 0);
+    $('#dshToday').textContent = String(((today && today.transactions) || []).length);
+    const acs = ac || { awaiting: 0, acknowledged: 0, disputed: 0 };
+    $('#dshAckRow').innerHTML = `
+      <span class="ack-chip awaiting">వేచి ${acs.awaiting}</span>
+      <span class="ack-chip ok">ధృవీకరించి ${acs.acknowledged}</span>
+      <span class="ack-chip disputed">వివాదం ${acs.disputed}</span>`;
+    const top = (cust || []).filter(c => c.balance > 0)
+      .sort((a, b) => b.balance - a.balance).slice(0, 5);
+    $('#dshTop').innerHTML = top.length
+      ? top.map((c, i) => `<div class="tx-row"><span class="dash-rank">${i + 1}</span>
+        <span class="tx-main"><b>${esc(c.name)}</b></span>
+        <b class="tx-amt owed">${esc(fmtINR(c.balance))}</b></div>`).join('')
+      : emptyState('📊', 'ఎవరికీ బాకీ లేదు · nobody owes anything', '');
+  } catch (e) {
+    if (e.status === 401) return goLogin();
+    showErr($('#dsherr'), e.message);
+  }
 }
-const viewDashboard = () => viewPlaceholder('#/dashboard', '📊', 'డాష్‌బోర్డ్', 'Dashboard', 'వారపు మొత్తాలు, ట్రెండ్‌లు ఇక్కడ చూడవచ్చు');
-const viewReports = () => viewPlaceholder('#/reports', '📋', 'రిపోర్ట్లు', 'Reports', 'ప్రింట్ / షేర్ చేసే నివేదికలు ఇక్కడ వస్తాయి');

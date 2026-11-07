@@ -45,6 +45,21 @@ function securityHeaders({ production = false } = {}) {
   };
 }
 
+// ---------- acknowledgement-token redaction for logs ----------
+// Ack link tokens are bearer secrets (anyone holding one can answer for the
+// customer). Any log line that would carry the full /a/<token> path or the
+// public /api/public/ack/<token> path prints the token as <redacted> instead —
+// the token itself is never logged, echoed or persisted.
+const TOKENISH_RE = /^[A-Za-z0-9_-]{43}$/;
+const PATH_TOKEN_RE1 = /(^|[^\w])\/a\/([A-Za-z0-9_-]{43})(?=[/?#]|$)/;
+const PATH_TOKEN_RE2 = /(^|[^\w])\/api\/public\/ack\/([A-Za-z0-9_-]{43})(?=[/?#]|$)/;
+function redactAckToken(s) {
+  return String(s == null ? '' : s)
+    .replace(PATH_TOKEN_RE1, '$1/a/<redacted>')
+    .replace(PATH_TOKEN_RE2, '$1/api/public/ack/<redacted>');
+}
+function isAckTokenShape(s) { return TOKENISH_RE.test(String(s || '')); }
+
 // ---------- same-origin / CSRF guard for browser mutations ----------
 // Signed httpOnly cookies + SameSite=Lax already block classic cross-site form
 // POSTs; this adds an explicit Origin check (covers same-site attackers, older
@@ -154,5 +169,7 @@ module.exports = {
   contentLength,
   errorHandler,
   validateJwtSecret,
+  redactAckToken,
+  isAckTokenShape,
   CSP, // exported for tests
 };

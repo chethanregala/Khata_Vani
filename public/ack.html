@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="te">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<meta name="theme-color" content="#0a7d4b">
+<title>ధృవీకరణ · Khata Vani</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+Telugu:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/ack.css">
+</head>
+<body>
+<main id="ack" class="page">
+  <div class="ack-box">
+    <p class="ack-brand">ఖాతా వాణి · Khata Vani</p>
+    <p class="ack-shop" id="ackShop" hidden></p>
+    <p class="ack-kind" id="ackKind" hidden></p>
+    <p class="ack-amount" id="ackAmount"></p>
+    <p class="ack-item" id="ackItem" hidden></p>
+    <p class="ack-date" id="ackDate" hidden></p>
+    <p class="ack-note" id="ackNote" hidden></p>
+    <p class="ack-state" id="ackState" hidden></p>
+    <div id="ackActions" class="ack-actions" hidden>
+      <button id="ackYes" class="ack-btn yes" type="button">✅ ధృవీకరిస్తున్నాను<small>I acknowledge</small></button>
+      <button id="ackNo" class="ack-btn warn" type="button">⚠️ వివాదం<small>Dispute</small></button>
+      <button id="ackListen" class="ack-btn audio" type="button" hidden>🔊 వినండి<small>Listen</small></button>
+    </div>
+    <div id="disputeForm" class="dispute-form" hidden>
+      <label for="dNote">కారణం (ఐచ్ఛికం) · Reason (optional)</label>
+      <textarea id="dNote" maxlength="200" rows="3" placeholder="ఎంత తేడా, ఏ సరుకు తేడా…"></textarea>
+      <div class="dispute-actions">
+        <button id="dSend" class="ack-btn warn small" type="button">⚠️ వివాదం నమోదు · Submit dispute</button>
+        <button id="dBack" class="ack-btn plain small" type="button">వెనుకకు · Back</button>
+      </div>
+    </div>
+    <p id="ackErr" class="ack-err" hidden></p>
+    <p class="ack-sent" id="ackSent" hidden></p>
+    <p class="ack-foot">link ద్వారా ధృవీకరణ · not legal proof</p>
+  </div>
+</main>
+<script src="/ack.js"></script>
+</body>
+</html>

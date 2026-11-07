@@ -53,7 +53,7 @@ global.fetch = async (url, opts) => {
 };
 
 const { app } = require('./server.js');
-const { validateJwtSecret, CSP } = require('./security.js');
+const { validateJwtSecret, CSP, redactAckToken, isAckTokenShape } = require('./security.js');
 
 let pass = 0, fail = 0;
 function check(what, cond, detail) {
@@ -106,7 +106,9 @@ function runServer(env) {
       env: Object.assign({}, process.env, env), cwd: __dirname, stdio: ['ignore', 'pipe', 'pipe'],
     });
     let out = '', settled = false;
-    const finish = extra => { if (!settled) { settled = true; clearTimeout(timer); resolve(Object.assign({ child, out }, extra)); } };
+    // expose `out` as a live getter: data events keep appending AFTER the
+    // promise resolves, and the log-scrubbing tests read it post-kill
+    const finish = extra => { if (!settled) { settled = true; clearTimeout(timer); resolve(Object.assign({ child, get out() { return out; } }, extra)); } };
     const timer = setTimeout(() => { child.kill(); finish({ code: null, timedOut: true }); }, 10000);
     child.stdout.on('data', d => {
       out += d;
@@ -321,6 +323,67 @@ let PORT = 0;
   r = await call('GET', '/api/no-such-route', { shop: 'sec-shop' });
   check('unknown /api route -> JSON 404', r.status === 404 && !!r.json, r.status + ' ' + r.text.slice(0, 120));
 
+  // ================= Sprint 3: public acknowledgement endpoints =================
+  check("unit: /a/<token> path redacted for logs",
+    redactAckToken('/a/' + crypto.randomBytes(32).toString('base64url')) === '/a/<redacted>',
+    redactAckToken('/a/' + crypto.randomBytes(32).toString('base64url')));
+  check('unit: /api/public/ack/<token> path redacted for logs',
+    redactAckToken('/api/public/ack/' + crypto.randomBytes(32).toString('base64url')) === '/api/public/ack/<redacted>',
+    'sample');
+  check('unit: non-token paths pass redaction untouched',
+    redactAckToken('/api/customers?x=1') === '/api/customers?x=1', 'sample');
+  check('unit: isAckTokenShape matches only 43-char base64url',
+    isAckTokenShape(crypto.randomBytes(32).toString('base64url')) &&
+    !isAckTokenShape('short') && !isAckTokenShape('x'.repeat(44)));
+
+  const pageTok = crypto.randomBytes(32).toString('base64url');
+  r = await call('GET', '/a/' + pageTok);
+  check('ack page serves publicly without cookies', r.status === 200 && r.text.indexOf('<html') !== -1,
+    r.status + ' ' + r.text.slice(0, 80));
+  check('ack page Cache-Control no-store', r.headers.get('cache-control') === 'no-store', r.headers.get('cache-control'));
+  check('ack page robots noindex', String(r.headers.get('x-robots-tag')).indexOf('noindex') !== -1,
+    r.headers.get('x-robots-tag'));
+  check('ack page Referrer-Policy no-referrer', (r.headers.get('referrer-policy') || '').indexOf('no-referrer') !== -1,
+    r.headers.get('referrer-policy'));
+  check('ack page still carries CSP/nosniff/frame-deny',
+    !!r.headers.get('content-security-policy') && r.headers.get('x-content-type-options') === 'nosniff' &&
+    r.headers.get('x-frame-options') === 'DENY', r.headers.get('content-security-policy'));
+
+  r = await call('GET', '/api/public/ack/' + pageTok);
+  check('unknown token view -> generic JSON 404', r.status === 404 && !!r.json && r.json.code === 'NOT_FOUND',
+    r.status + ' ' + r.text.slice(0, 120));
+  check('generic 404 reveals NOTHING (no token, no state word)',
+    r.text.indexOf(pageTok) === -1 && r.text.indexOf('revoked') === -1 && r.text.indexOf('expired') === -1,
+    r.text.slice(0, 200));
+  check('view 404 also no-store', r.headers.get('cache-control') === 'no-store', r.headers.get('cache-control'));
+
+  r = await call('GET', '/a/' + pageTok + '/audio');
+  check('unknown token audio -> generic JSON 404', r.status === 404 && !!r.json && r.json.code === 'NOT_FOUND',
+    r.status + ' ' + r.text.slice(0, 120));
+
+  r = await call('POST', '/api/public/ack/' + pageTok, { body: {} });
+  check('public respond without action -> 400', r.status === 400 && r.json && r.json.code === 'BAD_ACTION',
+    r.status + ' ' + r.text.slice(0, 120));
+  r = await call('POST', '/api/public/ack/' + pageTok, { body: { action: 'acknowledge' }, headers: { Origin: BASE } });
+  check('unknown token respond -> the same generic 404', r.status === 404 && !!r.json && r.json.code === 'NOT_FOUND',
+    r.status + ' ' + r.text.slice(0, 120));
+  r = await call('POST', '/api/public/ack/' + pageTok, {
+    body: JSON.stringify({ action: 'acknowledge' }),
+    headers: { Origin: 'https://evil.example', 'Content-Type': 'application/json' },
+  });
+  check('public respond is same-origin guarded too', r.status === 403, r.status);
+
+  // rate limit: 30/min per IP across ALL public ack POSTs (2 were sent above)
+  let fl = 0, firstLim = -1;
+  for (let i = 1; i <= 35; i++) {
+    const x = await call('POST', '/api/public/ack/' + crypto.randomBytes(32).toString('base64url'),
+      { body: { action: 'acknowledge' } });
+    fl = x.status;
+    if (fl === 429 && firstLim < 0) firstLim = i;
+  }
+  check('public ack POST rate limited at 30/min per IP', firstLim >= 28 && firstLim <= 31,
+    'first429=' + firstLim + ' last=' + fl);
+
   // ================= 14+15. production JWT secret validation =================
   const strong = crypto.randomBytes(48).toString('hex');
   const weak = 'change_me_to_a_long_random_string';
@@ -361,6 +424,32 @@ let PORT = 0;
       strongRun.out.indexOf(strong) === -1 && strongRun.out.indexOf(process.env.SUPABASE_SERVICE_KEY || '§') === -1,
       strongRun.out.slice(0, 300));
     strongRun.child.kill();
+  }
+
+  // ================= Sprint 3: the token never reaches the LOGS =================
+  // A spawned server (real process, captured stdout/stderr) is requested at
+  // the /a/<token> page, the audio route and the public POST; the captured
+  // output must never contain the raw token.
+  const scrubSecret = crypto.randomBytes(48).toString('hex');
+  const scrubPort = await freePort();
+  const scrubRun = await runServer({ JWT_SECRET: scrubSecret, PORT: String(scrubPort) });
+  check('scrub server starts', !!scrubRun.started, scrubRun.out.slice(0, 200));
+  if (scrubRun.started) {
+    const logTok = crypto.randomBytes(32).toString('base64url');
+    await realFetch('http://127.0.0.1:' + scrubPort + '/a/' + logTok);
+    await realFetch('http://127.0.0.1:' + scrubPort + '/a/' + logTok + '/audio');
+    await realFetch('http://127.0.0.1:' + scrubPort + '/api/public/ack/' + logTok);
+    await realFetch('http://127.0.0.1:' + scrubPort + '/api/public/ack/' + logTok, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ action: 'dispute', note: 'note-for-log-test' })
+    });
+    await new Promise(res => setTimeout(res, 600));
+    scrubRun.child.kill();
+    await new Promise(res => setTimeout(res, 800));
+    check('ack token never appears in server stdout/stderr', scrubRun.out.indexOf(logTok) === -1,
+      scrubRun.out.slice(-400));
+    check('no-store log line carries the redacted path only',
+      scrubRun.out.indexOf("/a/<redacted>") !== -1, scrubRun.out.slice(-400));
   }
 
   console.log(`\n${pass} passed, ${fail} failed`);
