@@ -129,7 +129,7 @@ function errorHandler() {
       return res.status(400).json({ error: 'అభ్యర్థన ఆగిపోయింది · request aborted' });
     }
     console.error('[error] id=' + rid + ' ' + ((err && (err.code || err.name)) || 'ERROR'));
-    return res.status(500).json({ error: 'సర్వర్ సమస్య, మళ్లీ ప్రయత్నించండి' });
+    return res.status(500).json({ error: 'సర్వర్ సమస్య, మళ్లీ ప్రయత్నించండి', id: rid });
   };
 }
 

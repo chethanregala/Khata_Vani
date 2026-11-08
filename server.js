@@ -34,6 +34,28 @@ const jwtCheck = validateJwtSecret(JWT_SECRET, { production: PROD });
 if (jwtCheck.level === 'fatal') { console.error('FATAL: ' + jwtCheck.message); process.exit(1); }
 if (jwtCheck.level === 'warn') console.warn('WARN: ' + jwtCheck.message);
 
+// ---- required env vars: fail fast in production, warn in development ----
+// Only the VARIABLE NAME is ever reported — never any value.
+const ENV_PLACEHOLDER_RE = /^(change|placeholder|example|your[_-]|secret$|password$|xxx+|dummy|test[-_]?key)/i;
+const REQ_ENV = [
+  ['JWT_SECRET', JWT_SECRET],
+  ['GNANI_API_KEY', K],
+  ['SUPABASE_URL', E.SUPABASE_URL],
+  ['SUPABASE_SERVICE_KEY', E.SUPABASE_SERVICE_KEY || E.SUPABASE_SECRET_KEY],
+  ...(PROD ? [['APP_ORIGIN', APP_ORIGIN]] : []),
+];
+const missingEnv = REQ_ENV.filter(([, v]) => !v || !String(v).trim()).map(([n]) => n);
+const placeholderEnv = REQ_ENV
+  .filter(([n, v]) => v && n !== 'JWT_SECRET' && ENV_PLACEHOLDER_RE.test(String(v).trim()))
+  .map(([n]) => n);
+if (missingEnv.length || placeholderEnv.length) {
+  const msg = 'FATAL: missing required env vars [' + missingEnv.join(', ') + ']' +
+    (placeholderEnv.length ? ' / placeholder values in [' + placeholderEnv.join(', ') + ']' : '') +
+    ' — set them in .env (values are never logged)';
+  if (PROD) { console.error(msg); process.exit(1); }
+  console.warn(msg.replace('FATAL:', 'WARN:'));
+}
+
 // optional: TRUST_PROXY=1 only when behind a trusted reverse proxy, so rate
 // limits see real client IPs instead of the proxy's single IP (default: off)
 if (E.TRUST_PROXY) {
@@ -72,7 +94,7 @@ function ledgerFail(res, e, ctx) {
   if (final >= 500) {
     const rid = (res.locals && res.locals.reqId) || '-';
     console.error('[ledger-fail] ' + ctx + ' id=' + rid + ' err=' + ((e && (e.code || e.name)) || 'ERROR') + pgDiag(e));
-    return res.status(final).json({ error: 'సర్వర్ సమస్య, మళ్లీ ప్రయత్నించండి' });
+    return res.status(final).json({ error: 'సర్వర్ సమస్య, మళ్లీ ప్రయత్నించండి', id: rid });
   }
   return res.status(final).json({ error: e.message, code: e.code });
 }
@@ -98,7 +120,7 @@ function fail(res, e, ctx) {
   if (e && e.code === 'NO_SUPA') return res.status(503).json({ error: 'డేటాబేస్ అమరిక లేదు, యజమానిని సంప్రదించండి' });
   const rid = (res.locals && res.locals.reqId) || '-';
   console.error('[fail] ' + ctx + ' id=' + rid + ' err=' + ((e && (e.code || e.name)) || 'ERROR'));
-  return res.status(500).json({ error: 'సర్వర్ సమస్య, మళ్లీ ప్రయత్నించండి' });
+  return res.status(500).json({ error: 'సర్వర్ సమస్య, మళ్లీ ప్రయత్నించండి', id: rid });
 }
 
 // TTS word cache: data/tts-cache/<sha1(word)>.wav — each word is synthesized once.
@@ -1247,6 +1269,16 @@ app.use(errorHandler());
 
 // listen only when run directly (tests require the app without binding a port)
 if (require.main === module) {
+  // ---- process-level safety net: log ONLY the error class + a request-less
+  // id — never messages (they can carry PII) — and keep serving where safe.
+  process.on('unhandledRejection', (e) => {
+    console.error('[proc] unhandledRejection id=- err=' + ((e && (e.code || e.name)) || 'ERROR'));
+  });
+  process.on('uncaughtException', (e) => {
+    console.error('[proc] uncaughtException id=- err=' + ((e && (e.code || e.name)) || 'ERROR'));
+    // in-flight requests already answer via the generic error handler; do not
+    // exit so a single bad async path cannot take the shop's khata offline
+  });
   app.listen(PORT, () => console.log('Khata Vani on http://localhost:' + PORT));
 }
 module.exports = { app };

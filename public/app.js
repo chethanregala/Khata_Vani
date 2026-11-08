@@ -46,6 +46,9 @@ function goLogin() {
   state.voiceOkToken = null; state.phone = null;
   if (location.hash !== '#/login') location.hash = '#/login';
 }
+// session-expired marker: api()/recorder set it on 401 so the login screen can
+// explain WHY the user was sent back (never shown on a fresh first visit)
+function markSessionExpired() { try { window.__kvSessionExpired = true; } catch (_) {} }
 
 // ---------- logo (inline SVG) ----------
 function logoSVG() {
@@ -86,6 +89,26 @@ function boot() {
 }
 boot();
 
+// ---------- offline / back-online banner ----------
+// CSP-safe: a single fixed div toggled by the online/offline events.
+(function netWatch() {
+  const bar = document.createElement('div');
+  bar.className = 'net-banner';
+  bar.setAttribute('role', 'status');
+  bar.hidden = true;
+  document.body.appendChild(bar);
+  const upd = () => {
+    const off = navigator.onLine === false;
+    bar.hidden = !off;
+    bar.textContent = off
+      ? 'ఇంటర్నెట్ లేదు — కనెక్షన్ వచ్చాక మళ్లీ ప్రయత్నించండి · you are offline'
+      : '';
+  };
+  window.addEventListener('offline', upd);
+  window.addEventListener('online', upd);
+  upd();
+})();
+
 // ---------- #/splash ----------
 function viewSplash() {
   appEl().innerHTML = `<div class="splash"><div class="splash-in">${logoSVG()}</div></div>`;
@@ -111,10 +134,13 @@ function viewLogin() {
         maxlength="10" placeholder="98765 43210" aria-label="మొబైల్ నంబర్">
     </div>
     <div id="lerr" class="err" hidden></div>
+    <div id="lexp" class="note" hidden>సెషన్ ముగిసింది — మళ్లీ లాగిన్ అవ్వండి · session expired, please log in again</div>
     <button id="next" class="btn primary big">తదుపరి</button>
   </div>`;
   const input = $('#phone');
   const err = $('#lerr');
+  const expNote = $('#lexp');
+  if (window.__kvSessionExpired) { expNote.hidden = false; window.__kvSessionExpired = false; }
   input.focus();
   input.addEventListener('input', () => {
     input.value = input.value.replace(/\D/g, '').slice(0, 10);
@@ -509,9 +535,21 @@ async function speak(text) {
 // ================= recording =================
 let activeRec = null, micBusy = false;
 async function startRecording() {
+  // unsupported browser: no getUserMedia / MediaRecorder / AudioContext ->
+  // a clear message; every mic card also has a manual-entry form fallback
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia ||
+      typeof MediaRecorder === 'undefined' || typeof OfflineAudioContext === 'undefined') {
+    throw new Error('ఈ బ్రౌజర్‌లో మైక్ సదుపాయం లేదు — చేతితో రాయండి · mic unsupported, use manual entry');
+  }
   let stream;
   try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
-  catch (_) { throw new Error('మైక్ అనుమతి లేదు, బ్రౌజర్‌లో అనుమతించండి'); }
+  catch (e) {
+    const n = e && e.name;
+    if (n === 'NotFoundError' || n === 'DevicesNotFoundError' || n === 'OverconstrainedError') {
+      throw new Error('మైక్ కనబడలేదు — చేతితో రాయండి · no microphone found, use manual entry');
+    }
+    throw new Error('మైక్ అనుమతి లేదు, బ్రౌజర్‌లో అనుమతించండి · mic permission denied');
+  }
   const rec = new MediaRecorder(stream);
   const chunks = [];
   rec.ondataavailable = e => chunks.push(e.data);
@@ -526,11 +564,17 @@ async function startRecording() {
           body: await toWav(new Blob(chunks)),
         });
         const x = await res.text();
-        if (res.status === 401) { goLogin(); reject(new Error('సెషన్ ముగిసింది')); return; }
+        if (res.status === 401) { markSessionExpired(); goLogin(); reject(new Error('సెషన్ ముగిసింది')); return; }
         let j = {}; try { j = JSON.parse(x); } catch (_) {}
         if (!j.transcript) { reject(new Error('వినపడలేదు, మళ్లీ చెప్పండి')); return; }
         resolve(String(j.transcript));
-      } catch (e) { reject(e); }
+      } catch (e) {
+        // never surface a raw fetch error to the screen
+        if (e && e.message === 'సెషన్ ముగిసింది') return reject(e);
+        reject(new Error((typeof navigator !== 'undefined' && navigator.onLine === false)
+          ? 'ఇంటర్నెట్ లేదు — కనెక్షన్ తనిఖీ చేయండి · you are offline'
+          : 'ఇంటర్నెట్ సమస్య, మళ్లీ ప్రయత్నించండి'));
+      }
     };
   });
   const timer = setTimeout(() => { try { rec.stop(); } catch (_) {} }, 20000);

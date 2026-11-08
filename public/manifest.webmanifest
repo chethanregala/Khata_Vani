@@ -1,0 +1,16 @@
+{
+  "name": "Khata Vani / ఖాతా వాణి",
+  "short_name": "Khata Vani",
+  "description": "Voice-first khata for kirana shops and rythu (farmer) traders",
+  "lang": "te",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "theme_color": "#0a7d4b",
+  "background_color": "#ffffff",
+  "icons": [
+    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}

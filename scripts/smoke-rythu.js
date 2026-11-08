@@ -79,6 +79,7 @@ function stepFail(name, status) {
 
   const shopId = crypto.randomUUID(); // tracking key ONLY for the fallback sweep
   let realShopId = null;
+  let realShop2Id = null;
   try {
     // ---- 1. signup through the real auth flow ----
     // valid: starts with 9, ten digits; the number itself is NEVER printed
@@ -270,10 +271,86 @@ function stepFail(name, status) {
     const mTok3 = /\/a\/([A-Za-z0-9_-]{43})$/.exec(String(al3.data && al3.data.url || ''));
     const token3 = mTok3 ? mTok3[1] : '';
     const dead = await fetch(BASE + '/api/public/ack/' + token1);
-    ok('the OLD link answers the generic 404 after a re-mint', dead.status === 404);
+    const deadBody = dead.ok ? await dead.json().catch(() => null) : null;
+    // by design only AWAITING links are revoked on re-mint (tests/test-ack.js):
+    // the old link was already ANSWERED, so it either 404s (revoked) or still
+    // truthfully reads acknowledged — it must never read awaiting again.
+    ok('the OLD link after re-mint never reads awaiting again',
+      dead.status === 404 || (!!deadBody && deadBody.status === 'acknowledged'), dead.status);
     const fresh3 = await fetch(BASE + '/api/public/ack/' + token3);
     const fv = fresh3.ok ? await fresh3.json() : null;
     ok('the NEW link works and the entry is awaiting again', fresh3.status === 200 && fv && fv.status === 'awaiting');
+
+    // ---- 14. idempotent retry: the same idempotency key returns the SAME row ----
+    const idemKey = crypto.randomUUID();
+    const idemBody = () => ({
+      customer_id: kid, workflow: 'kirana', direction: 'receivable', type: 'credit', event: 'goods_credit',
+      amount: 55, idempotency_key: idemKey, source: 'screen',
+    });
+    const p1 = await reqJSON('idem-post-1', 'POST', '/api/transactions', idemBody());
+    if (!p1.res.ok) throw p1.out;
+    const p2 = await reqJSON('idem-post-2', 'POST', '/api/transactions', idemBody());
+    if (!p2.res.ok) throw p2.out;
+    ok('idempotent retry returns the SAME row (no double entry)',
+      p2.data && p2.data.dedup === true && p2.data.id === p1.data.id);
+
+    // ---- 15. kirana credit -> payment -> reversal (+ reverse retry replay) ----
+    const rv = await reqJSON('reverse-payment', 'POST', '/api/transactions/' + (kPay.data && kPay.data.id) + '/reverse', { reason: 'smoke reversal' });
+    if (!rv.res.ok) throw rv.out;
+    ok('payment reversal posts an offsetting row', !!rv.data && !!rv.data.reversal);
+    const rv2 = await reqJSON('reverse-retry', 'POST', '/api/transactions/' + (kPay.data && kPay.data.id) + '/reverse', { reason: 'smoke reversal' });
+    ok('reverse retry replays the SAME reversal row (idempotent)',
+      rv2.res.ok && rv2.data && rv.data && rv2.data.reversal.id === rv.data.reversal.id);
+    // the rythu delivery is a settlement ANCHOR with linked rows -> must refuse
+    const revAnchor = await reqJSON('reverse-anchor-rejected', 'POST', '/api/transactions/' + d.id + '/reverse', { reason: 'smoke anchor' });
+    ok('delivery anchor with linked rows is NOT reversible (409)',
+      !revAnchor.res.ok && revAnchor.res.status === 409, revAnchor.res.status);
+
+    // ---- 16. overpayment rejection ----
+    const op = await reqJSON('overpay-rejected', 'POST', '/api/transactions', {
+      customer_id: kid, workflow: 'kirana', type: 'pay', event: 'repayment', amount: 9999999,
+      idempotency_key: crypto.randomUUID(), source: 'screen',
+    });
+    ok('kirana overpayment rejected with 409', !op.res.ok && op.res.status === 409, op.res.status);
+
+    // ---- 17. duplicate-name resolution: two customers named Ramesh ----
+    const rm1 = await reqJSON('dup-1', 'POST', '/api/customers', { name: 'Ramesh', kind: 'customer' });
+    const rm2 = await reqJSON('dup-2', 'POST', '/api/customers', { name: 'Ramesh', kind: 'customer' });
+    ok('two same-name customers created', rm1.res.ok && rm2.res.ok);
+    const pp = await reqJSON('propose-dup', 'POST', '/api/voice/propose', { transcript: 'Ramesh 500 ఉద్దెర' });
+    if (!pp.res.ok) throw pp.out;
+    const pEntry = (pp.data && pp.data.candidate && pp.data.candidate[0]) || {};
+    ok('duplicate names resolve as ambiguous (many, 2 options)',
+      pEntry.status === 'many' && (pEntry.candidates || []).length === 2 &&
+      pp.data.ambiguities && pp.data.ambiguities.length === 1);
+
+    // ---- 18. balances equal sums (kirana kid: 300 + 55 + 70, payment reversed) ----
+    const cl = await fetch(BASE + '/api/customers', { headers: { Cookie: cookie } });
+    const clData = cl.ok ? await cl.json() : null;
+    const custRow = ((clData && (clData.customers || clData)) || []).find(c => c.id === kid);
+    const tl2 = await fetch(BASE + '/api/customers/' + kid + '/transactions', { headers: { Cookie: cookie } });
+    const rows3 = tl2.ok ? ((await tl2.json()).transactions || []) : [];
+    // the product's invariant: balance == credit-sum minus pay-sum over ALL rows
+    // (a reversed row and its offsetting reversal cancel each other)
+    const sumP = rows3.reduce((a, t) => a + (t.type === 'credit' ? 1 : -1) * Math.round(Number(t.amount) * 100), 0) / 100;
+    ok('customer balance equals the ledger sum over all rows',
+      !!custRow && Number(custRow.balance) === sumP, 'sum=' + sumP);
+
+    // ---- 19. cross-shop isolation: a second shop cannot touch shop A's rows ----
+    const cookieA = cookie;
+    const phone2 = '9' + String((Date.now() + 7) % 1000000000).padStart(9, '0');
+    const tokB = jwt.sign({ phone: phone2, purpose: 'voiceOk' }, JWT_SECRET, { expiresIn: '5m' });
+    cookie = null;
+    const up2 = await reqJSON('signup-b', 'POST', '/api/auth/signup', { phone: phone2, pin: '1234', voiceOkToken: tokB });
+    if (!up2.res.ok) throw up2.out;
+    realShop2Id = up2.data && up2.data.shop && up2.data.shop.id;
+    const isoT = await fetch(BASE + '/api/customers/' + kid + '/transactions', { headers: { Cookie: cookie } });
+    ok('cross-shop customer timeline reads as 404', isoT.status === 404, isoT.status);
+    const isoRev = await reqJSON('cross-shop-reverse', 'POST', '/api/transactions/' + p1.data.id + '/reverse', { reason: 'smoke iso' });
+    ok('cross-shop reverse rejected', !isoRev.res.ok && isoRev.res.status === 404, isoRev.res.status);
+    const isoAck = await reqJSON('cross-shop-ack', 'POST', '/api/transactions/' + entryId + '/ack-link', {});
+    ok('cross-shop ack-link rejected', !isoAck.res.ok && isoAck.res.status === 404, isoAck.res.status);
+    cookie = cookieA; // back to shop A's session for any later steps
 
     console.log('\n[smoke] EVERY STEP PASSED — rythu save works against the real server');
   } catch (e) {
@@ -293,6 +370,12 @@ function stepFail(name, status) {
         await del('transactions', 'transactions', 'shop_id', realShopId); // one statement: self-ref FK checked at statement end
         await del('customers', 'customers', 'shop_id', realShopId);
         await del('shop', 'shops', 'id', realShopId);
+      }
+      if (realShop2Id) {
+        await del('audit-events-2', 'audit_events', 'shop_id', realShop2Id);
+        await del('transactions-2', 'transactions', 'shop_id', realShop2Id);
+        await del('customers-2', 'customers', 'shop_id', realShop2Id);
+        await del('shop-2', 'shops', 'id', realShop2Id);
       }
       // safety net: the signup SUCCEEDED but the response parsing failed
       // (then-shop-id sweep keyed by the random phone is unnecessary —

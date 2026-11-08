@@ -1,74 +1,76 @@
 # Khata Vani (ఖాతా వాణి)
 
-Voice-first ledger for small shops. Telugu first, English second.
+A voice-first ledger ("khata") app for Indian kirana shops and rythu (farmer/produce) traders. The shopkeeper speaks in Telugu; the app parses the sentence, shows a confirmation card, and posts double-safe ledger entries. Customers get a shareable link (with QR and Telugu audio) to acknowledge or dispute a credit — no app or login needed on their side.
 
-## Run
-1. `npm install`  2. `cp .env.example .env` and put your Gnani key + Supabase URL/key + `JWT_SECRET`
-3. `npm start`  4. open http://localhost:3000 (Chrome; mic needs localhost/HTTPS)
+## Workflows
 
-Check voice names / language codes in Gnani docs if TTS errors: set `TTS_VOICE`, `TTS_LANG` in `.env`.
+- **Kirana**: "రమేష్ 500 ఉద్దెర" → goods credit on the customer's account; "జమ" records a repayment. Overpayments are rejected; reversals write offsetting rows (history is never deleted).
+- **Rythu**: a produce delivery (quantity × rate, server-computed) becomes a settlement anchor; advances, deductions (hamali, commission, transport…) and payments auto-link to it, and the remaining balance is always cash-out exact.
+- **Acknowledgements**: any kirana credit can mint a secret link `/a/<token>` — QR + summary audio for the customer to acknowledge, dispute, or resolve. One active link per entry; re-minting revokes awaiting links; answered links keep their truthful state.
+
+## Voice models (Gnani)
+
+- **Prisma STT** (`/api/stt` → `prisma-v3.0`): spoken entries, balance queries, and name-choice replies.
+- **Timbre TTS** (`/api/tts`): confirmations, query answers, login word-check words, and acknowledgement-link audio.
+
+Both are server-side proxies with per-shop rate limits, timeouts, and strict validation. Raw provider payloads are never forwarded or logged.
+
+## Setup
+
+```bash
+npm install
+cp .env.example .env      # fill the vars below
+npm start                 # http://localhost:3000
+```
+
+Required env vars (missing/placeholder values are fatal at startup in production, warn in dev; values are never printed):
+
+| Var | Purpose |
+|---|---|
+| `GNANI_API_KEY` | Gnani STT/TTS key |
+| `SUPABASE_URL` | Supabase project URL |
+| `SUPABASE_SERVICE_KEY` | Supabase service-role key (`SUPABASE_SECRET_KEY` also accepted) |
+| `JWT_SECRET` | ≥32 chars, ≥12 distinct, not a placeholder |
+| `APP_ORIGIN` | production only — canonical public origin for ack links |
+| `TRUST_PROXY` | `1` behind a reverse proxy (Render), so rate limits see real IPs |
+| `NODE_ENV` | `production` enables secure cookies, HSTS, strict config checks |
+
+## npm scripts
+
+- `npm start` — run the server
+- `npm test` — hermetic suites: parser, resolver, security, ledger, rythu, acknowledgements
+- `npm run smoke` — end-to-end flow against the real Supabase (server must be running); creates a throwaway shop and cleans up everything
+- `npm run seed` / `npm run seed:clean` — demo data in / out
+
+## Deploy (Render)
+
+- Build: `npm install` · Start: `npm start`
+- Env: `NODE_ENV=production`, `TRUST_PROXY=1`, `APP_ORIGIN=https://<your-domain>`, plus the vars above.
+- Persistent disk for `data/tts-cache` (optional — it regenerates; the server starts fine if it is missing).
+
+## Architecture (10 lines)
+
+1. Express server (`server.js`) — CSP-safe static frontend + JSON API, signed httpOnly session cookies.
+2. `security.js` — request ids, strict CSP/headers, same-origin CSRF guard, opaque error handler, secret validation.
+3. `lib/money.js` — integer paise math; amounts are exact up to ₹99,99,999 with Indian grouping.
+4. `lib/ledger.js` — transactions in Supabase Postgres: server-computed amounts, idempotency keys, reversals, settlement allocation.
+5. `lib/ack.js` — hashed (never plaintext) acknowledgement tokens, expiry, revoke-on-reversal, dispute/resolve state machine.
+6. `public/app.js` — hash-routed SPA: splash → login (phone + spoken word + PIN) → profile → home/kirana/rythu tabs.
+7. `public/parser.js` + `rythu-parser.js` — rule-based Telugu/English parser; `resolver.js` — exact/label/alias/fuzzy name matching shared client+server.
+8. Mic flow: record → `/api/stt` → propose card → confirm (idempotent key) → save.
+9. TTS flow: `/api/tts` with a sentence cache in `data/tts-cache/` — voice is a convenience, never a gate.
+10. Migrations in `supabase/migrations/` (additive; no destructive changes).
+
+## Known limitations
+
+- **Demo-grade login**: phone + voice word-check + PIN proves device/audio interaction, not phone ownership. Production roadmap: SMS OTP or passkeys.
+- **Acknowledgements are link-based, not legal proof**: anyone holding the secret link can answer; links are hashed, expiring, and revocable, but possession is the only credential.
+- **Free-tier cold starts**: on Render's free tier the first request after idle can take tens of seconds; TTS/STT also add latency.
+- **Rule-based parser**: no LLM fallback — unusual phrasings fall back to manual entry with a friendly explanation.
 
 ## Tests
+
+```bash
+npm test          # 52 hermetic checks (no network, no credits spent)
+npm run smoke     # 40 end-to-end checks against the real Supabase
 ```
-npm test                 # parser + resolver + security suites (5 + 13 + 81 checks)
-node test-parser.js      # rule-based speech parser
-node test-resolver.js    # customer name resolution (exact / label / alias / fuzzy)
-node test-security.js    # security suite — mocked Gnani, no DB traffic
-node data/kv-flow-test.js && node data/kv-dom-test.js   # Phase B harnesses (24 + 55)
-```
-
-## Security
-Hardening pass over the Phase B app — details in [`SECURITY-HARDENING.md`](SECURITY-HARDENING.md).
-
-- **TTS/STT**: both behind auth + 60/min **per-shop** limits (separate buckets) so strangers can never burn Gnani credits; strict body validation (TTS: JSON only, non-empty string ≤1000 chars, 8 KB cap; STT: `audio/*`, 5 MB cap).
-- **Gnani proxy**: explicit timeouts (TTS 15 s, STT 30 s), failures mapped to safe 502/504 Telugu messages — raw provider responses are never logged or forwarded.
-- **Logs**: only route + request-id + error category. Never transcripts, names, phones, PINs, tokens, audio, or keys.
-- **Headers**: strict CSP (no `unsafe-inline`; Google Fonts, mic, and audio still allowed), `nosniff`, `Referrer-Policy`, frame deny, `Permissions-Policy`, COOP, HSTS in production only.
-- **CSRF**: Origin check on every POST/PUT/PATCH/DELETE (host match or `APP_ORIGIN` allowlist); missing-Origin requests rejected only when `Sec-Fetch-Site: cross-site`.
-- **JWT secret**: production startup rejects weak/placeholder secrets (never prints the value); development only warns. No automatic rotation.
-- **Auth honesty**: the spoken-word challenge proves the *audio interaction*, not phone ownership — OTP is a documented future requirement.
-
-Optional `.env`: `APP_ORIGIN` (extra allowed origins), `TRUST_PROXY=1` (only behind a trusted reverse proxy).
-
-## Deploy on Render (free Web Service)
-
-- **Build command:** `npm install`  **Start command:** `npm start`  (server listens on `process.env.PORT`, so no port config needed)
-- **Runtime:** Node >= 20 (see `engines` in `package.json`; Render's Node image is fine)
-- **Health check path:** `/healthz` (plain GET, returns `{"ok":true}` — no auth, exposes no secrets)
-
-### Environment variables to set in the Render dashboard
-
-| Variable | Value | Notes |
-|---|---|---|
-| `NODE_ENV` | `production` | enables HSTS, secure cookies, hard JWT-secret validation |
-| `TRUST_PROXY` | `1` | one Render proxy hop — rate limits then key on the real client IP |
-| `APP_ORIGIN` | `https://<my-service>.onrender.com` | your Render URL (replace `<my-service>`); CSRF Origin allowlist |
-| `GNANI_API_KEY` | *(your Gnani key — keep secret)* | STT + TTS; stored on the server only, never sent to the browser |
-| `STT_LANG` | `indic-auto` | speech-recognition language |
-| `TTS_VOICE` | `Nalini` | voice used for the challenge words |
-| `TTS_LANG` | `te-IN` | TTS language |
-| `TTS_MODEL` | `timbre-v2.5` | TTS model |
-| `SUPABASE_URL` | *(your project URL)* | Supabase REST endpoint |
-| `SUPABASE_SERVICE_KEY` | *(service-role key — keep secret)* | server-side only; `SUPABASE_SECRET_KEY` is also accepted |
-| `JWT_SECRET` | *(random 32+ chars, 12+ distinct)* | never reuse the dev value; session-cookie signing |
-
-The `data/tts-cache` directory is created automatically at startup (`mkdirSync`, recursive), so a fresh Render disk works with no manual steps. Free-tier disks are ephemeral — the cache just regenerates on redeploy (one Gnani call per unique word).
-
-Never commit `.env`; all secrets go in the Render env-var list above.
-
-## Phase B (what's in here)
-- **Backend** (all `requireAuth`, every id re-checked against the session shop):
-  `PATCH /api/customers/:id`, `POST /api/customers/merge`, `GET /api/customers/:id/transactions`,
-  `DELETE /api/transactions/:id` (today's entries only), `GET /api/customers` (+ `last_payment_at`),
-  `GET /api/transactions?recent=N`.
-- **Name resolution** — `public/resolver.js`, plain JS, unit-testable in Node like `parser.js`:
-  exact → label narrowing → Levenshtein-1 fuzzy, returns `none | one | many | fuzzy`.
-- **Home voice flow** — new customer prompt (label + phone), fuzzy "did you mean?" (yes saves an
-  alias), duplicate-name chooser sheet read out in Telugu and pickable by tap or by saying the number.
-- **Multi-entry** — one sentence, several entries, one confirmation, per-entry delete, saved in order.
-- **Queries** — `<name> ki entha baaki`, `ee roju entha udhaar` / `today's credit`, `top 3 baaki`.
-- **UI** — 4-tab bar (Home / Customers / Dashboard / Reports), animated mic, today strip,
-  customers search + sort chips + overdue chip, customer detail with timeline, Receive payment,
-  edit and merge, empty states and loading skeletons.
-
-Dashboard and Reports are placeholders ("coming soon") for Phase C.

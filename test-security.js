@@ -414,7 +414,10 @@ let PORT = 0;
     weakRun.out.indexOf(weak) === -1, weakRun.out.slice(0, 300));
 
   const strongPort = await freePort();
-  const strongRun = await runServer({ NODE_ENV: 'production', JWT_SECRET: strong, PORT: String(strongPort) });
+  const strongRun = await runServer({
+    NODE_ENV: 'production', JWT_SECRET: strong, PORT: String(strongPort),
+    APP_ORIGIN: 'https://khata-vani.example', // required in production since the env-validation pass
+  });
   check('valid production config starts (15)', !!strongRun.started, 'code=' + strongRun.code + ' out=' + strongRun.out.slice(0, 200));
   if (strongRun.started) {
     const pr = await realFetch('http://127.0.0.1:' + strongPort + '/');
