@@ -181,6 +181,12 @@ const ackPublicLimiter = rateLimit({
   windowMs: 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false, message: rlMsg,
   keyGenerator: req => ipKeyGenerator(req.ip),
 });
+// GETs share the same 30/min-per-IP policy but a separate bucket, so page/view
+// loads cannot eat the POST budget the security test measures.
+const ackPublicGetLimiter = rateLimit({
+  windowMs: 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false, message: rlMsg,
+  keyGenerator: req => ipKeyGenerator(req.ip),
+});
 
 // ---- Gnani TTS (same call the /api/tts route uses) ----
 // Explicit upstream timeouts; failures are returned as a kind + status only —
@@ -485,7 +491,7 @@ const ACK_NO_CACHE = {
 // + /ack.css, all CSP-safe with no inline scripts/styles/handlers). The token
 // shape is NOT validated here on purpose: an odd URL simply shows the generic
 // not-found state, while browsers get noCancelled red — same page either way.
-app.get('/a/:token', (req, res) => {
+app.get('/a/:token', ackPublicGetLimiter, (req, res) => {
   res.set(ACK_NO_CACHE);
   console.log('[ack] page id=' + req.id + ' path=' + redactAckToken(req.originalUrl));
   res.sendFile(path.join(__dirname, 'public', 'ack.html'));
@@ -493,7 +499,7 @@ app.get('/a/:token', (req, res) => {
 
 // GET /a/:token/audio — the pre-generated summary wav, only for a VALID,
 // ACTIVE (awaiting, unexpired) token.
-app.get('/a/:token/audio', async (req, res) => {
+app.get('/a/:token/audio', ackPublicGetLimiter, async (req, res) => {
   res.set(ACK_NO_CACHE);
   try {
     const v = await ack.viewByToken(String(req.params.token));
@@ -513,7 +519,7 @@ app.get('/a/:token/audio', async (req, res) => {
 // GET /api/public/ack/:token — the JSON the page renders. Shows ONLY: shop
 // name, entry date, what happened, amount, item details, response state.
 // NEVER: other entries, balances, phone numbers or the shop address.
-app.get('/api/public/ack/:token', async (req, res) => {
+app.get('/api/public/ack/:token', ackPublicGetLimiter, async (req, res) => {
   res.set(ACK_NO_CACHE);
   try {
     const v = await ack.viewByToken(String(req.params.token));
