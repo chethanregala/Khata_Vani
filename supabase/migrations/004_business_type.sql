@@ -26,23 +26,18 @@ END $$;
 -- Reversed transactions still count: they are historical evidence either way.
 UPDATE shops s
 SET business_type = (
-  WITH w AS (
-    SELECT
-      MAX(CASE WHEN t.workflow = 'rythu' THEN 1 END) AS has_ry,
-      MAX(CASE WHEN t.workflow <> 'rythu' THEN 1 END) AS has_ki
-    FROM transactions t WHERE t.shop_id = s.id
-  ), c AS (
-    SELECT
-      MAX(CASE WHEN u.kind = 'farmer' THEN 1 END) AS has_ry,
-      MAX(CASE WHEN u.kind <> 'farmer' THEN 1 END) AS has_ki
-    FROM customers u WHERE u.shop_id = s.id
-  )
   SELECT CASE
-    WHEN (w.has_ry OR c.has_ry) IS NOT NULL AND NOT (COALESCE(w.has_ki,0) + COALESCE(c.has_ki,0)) > 0 THEN 'rythu'
-    WHEN (w.has_ki OR c.has_ki) IS NOT NULL AND NOT (COALESCE(w.has_ry,0) + COALESCE(c.has_ry,0)) > 0 THEN 'kirana'
+    WHEN x.ry_count > 0 AND x.ki_count = 0 THEN 'rythu'
+    WHEN x.ki_count > 0 AND x.ry_count = 0 THEN 'kirana'
     ELSE NULL
   END
-  FROM w, c
+  FROM (
+    SELECT
+      (SELECT COUNT(*) FROM transactions t WHERE t.shop_id = s.id AND t.workflow = 'rythu')
+        + (SELECT COUNT(*) FROM customers u WHERE u.shop_id = s.id AND u.kind = 'farmer') AS ry_count,
+      (SELECT COUNT(*) FROM transactions t WHERE t.shop_id = s.id AND t.workflow <> 'rythu')
+        + (SELECT COUNT(*) FROM customers u WHERE u.shop_id = s.id AND u.kind <> 'farmer') AS ki_count
+  ) x
 );
 
 CREATE INDEX IF NOT EXISTS shops_business_type_idx ON shops (business_type);
