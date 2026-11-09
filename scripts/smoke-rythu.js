@@ -184,6 +184,13 @@ function stepFail(name, status) {
     const sm = await fetch(BASE + '/api/rythu/summary', { headers: { Cookie: cookie } });
     ok('rythu summary readable without error', sm.ok);
 
+    // ---- 5b. the settlement ANCHOR with linked rows is NOT reversible (409) ----
+    // must run in shop A's own session (a cross-shop session correctly reads 404)
+    const revAnchor = await reqJSON('reverse-anchor-rejected', 'POST', '/api/transactions/' + d.id + '/reverse', { reason: 'smoke anchor' });
+    ok('delivery anchor with linked rows is NOT reversible (409)',
+      !revAnchor.res.ok && revAnchor.res.status === 409 && revAnchor.out.code === 'HAS_LINKED_ROWS',
+      revAnchor.res.status + '/' + revAnchor.out.code);
+
     // ================= second shop: a KIRANA shop for the ack flow =================
     const phoneB = '9' + String((Date.now() + 3) % 1000000000).padStart(9, '0');
     const tokB = jwt.sign({ phone: phoneB, purpose: 'voiceOk' }, JWT_SECRET, { expiresIn: '5m' });
@@ -360,10 +367,10 @@ function stepFail(name, status) {
     const rv2 = await reqJSON('reverse-retry', 'POST', '/api/transactions/' + (kPay.data && kPay.data.id) + '/reverse', { reason: 'smoke reversal' });
     ok('reverse retry replays the SAME reversal row (idempotent)',
       rv2.res.ok && rv2.data && rv.data && rv2.data.reversal.id === rv.data.reversal.id);
-    // the rythu delivery is a settlement ANCHOR with linked rows -> must refuse
-    const revAnchor = await reqJSON('reverse-anchor-rejected', 'POST', '/api/transactions/' + d.id + '/reverse', { reason: 'smoke anchor' });
-    ok('delivery anchor with linked rows is NOT reversible (409)',
-      !revAnchor.res.ok && revAnchor.res.status === 409, revAnchor.res.status);
+    // the rythu delivery belongs to shop A -> shop B's session reads it as 404
+    const revAnchorX = await reqJSON('cross-shop-anchor-404', 'POST', '/api/transactions/' + d.id + '/reverse', { reason: 'smoke anchor x' });
+    ok('cross-shop anchor reverse reads as 404',
+      !revAnchorX.res.ok && revAnchorX.res.status === 404, revAnchorX.res.status);
 
     // ---- 16. overpayment rejection ----
     const op = await reqJSON('overpay-rejected', 'POST', '/api/transactions', {
