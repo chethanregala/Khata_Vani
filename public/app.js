@@ -16,7 +16,7 @@ const state = {
   recent: [],          // last 5 entries across days
   custSort: 'balance', // customers screen sort chip
   custQuery: '',       // customers screen search box
-  mode: (() => { try { return localStorage.getItem('kv-mode') === 'rythu' ? 'rythu' : 'kirana'; } catch (_) { return 'kirana'; } })(),
+  mode: null,          // business_type: 'kirana' | 'rythu' — set from shop.business_type (never localStorage)
   rythuFarmers: [],    // kind='farmer' customers (rythu mode)
   rythuSummary: null,  // rythu Home strip data (one IST day, computed on read)
 };
@@ -43,8 +43,14 @@ const newKey = () => (self.crypto && crypto.randomUUID)
 const ADVANCE_TE_EN = 'అడ్వాన్స్ వసూలు చేయాలి · advance to recover';
 function goLogin() {
   state.shop = null; state.customers = []; state.today = []; state.recent = [];
-  state.voiceOkToken = null; state.phone = null;
+  state.voiceOkToken = null; state.phone = null; state.mode = null;
   if (location.hash !== '#/login') location.hash = '#/login';
+}
+// shop -> UI: the whole experience (tabs, wording, voice parsing) follows the
+// shop's business_type from the server — one shop, one experience
+function applyShop(shop) {
+  state.shop = shop || null;
+  state.mode = shop && shop.business_type ? shop.business_type : null;
 }
 // session-expired marker: api()/recorder set it on 401 so the login screen can
 // explain WHY the user was sent back (never shown on a fresh first visit)
@@ -73,8 +79,14 @@ function route() {
   const view = (location.hash || '#/splash').split('?')[0];
   if (view.startsWith('#/rythu/farmer/')) return viewRythuFarmer(decodeURIComponent(view.slice('#/rythu/farmer/'.length)));
   if (view.startsWith('#/customer/')) return viewCustomer(decodeURIComponent(view.slice('#/customer/'.length)));
-  if (view === '#/customers') return viewCustomers();
+  if (view === '#/customers' || view === '#/farmers') {
+    // one list per business type; walking into the other's list just shows yours
+    if (view === '#/farmers' || state.mode === 'rythu') return viewFarmers();
+    return viewCustomers();
+  }
   if (view === '#/dashboard') return viewDashboard();
+  if (view === '#/settings') return viewSettings();
+  if (view === '#/choose-type') return viewChooseType();
   if (view === '#/login') return viewLogin();
   if (view === '#/verify') return viewVerify();
   if (view === '#/profile') return viewProfile();
@@ -115,9 +127,10 @@ function viewSplash() {
   const meP = api('/api/me').catch(() => null); // 401 / offline -> null
   setTimeout(async () => {
     const me = await meP;
-    if (!me) { state.shop = null; location.hash = '#/login'; }
-    else if (!me.profileComplete) { state.shop = me.shop; location.hash = '#/profile'; }
-    else { state.shop = me.shop; location.hash = '#/home'; }
+    if (!me) { applyShop(null); location.hash = '#/login'; }
+    else if (!me.profileComplete) { applyShop(me.shop); location.hash = '#/profile'; }
+    else if (!me.shop.business_type) { applyShop(me.shop); location.hash = '#/choose-type'; }
+    else { applyShop(me.shop); location.hash = '#/home'; }
   }, 1800);
 }
 
@@ -331,7 +344,7 @@ async function submitPin(pin) {
         method: 'POST',
         body: { phone: state.phone, pin, voiceOkToken: state.voiceOkToken },
       });
-      state.shop = r.shop;
+      applyShop(r.shop);
       state.voiceOkToken = null;
       location.hash = '#/profile';
     } catch (e) {
@@ -348,9 +361,10 @@ async function submitPin(pin) {
       method: 'POST',
       body: { phone: state.phone, pin, voiceOkToken: state.voiceOkToken },
     });
-    state.shop = r.shop;
+    applyShop(r.shop);
     state.voiceOkToken = null;
-    location.hash = '#/home';
+    // an existing shop that never chose a type goes to the choice first
+    location.hash = r.shop && r.shop.business_type ? '#/home' : '#/choose-type';
   } catch (e) {
     renderDots();
     if (e.status === 400 && e.message.indexOf('ధ్వని') !== -1) return backToVoice(e.message);
@@ -364,7 +378,7 @@ async function viewProfile() {
   try { me = await api('/api/me'); }
   catch (e) { if (e.status === 401) return goLogin(); }
   if (!me) return;
-  state.shop = me.shop;
+  applyShop(me.shop);
   const s = me.shop || {};
   appEl().innerHTML = `
   <div class="page">
@@ -394,13 +408,176 @@ async function viewProfile() {
     btn.disabled = true;
     try {
       const r = await api('/api/me', { method: 'PUT', body: { owner_name, shop_name, address } });
-      state.shop = r.shop;
-      location.hash = '#/home';
+      applyShop(r.shop);
+      // profile done -> the business-type choice (or Home when already chosen)
+      location.hash = r.shop && r.shop.business_type ? '#/home' : '#/choose-type';
     } catch (e) {
       btn.disabled = false;
       if (e.status === 401) return goLogin();
       showErr(err, e.message);
     }
+  };
+}
+
+// ---------- #/choose-type: one-time business type choice (kirana | rythu) ----------
+// Full-screen, required:_WITHOUT_ a type the whole ledger is blocked server-side
+// (403 BUSINESS_TYPE_REQUIRED). Two big cards -> confirm step -> PUT once.
+const BIZ_ICONS = {
+  kirana: '<svg class="biz-ic" viewBox="0 0 48 48" aria-hidden="true"><rect x="6" y="16" width="36" height="26" rx="4" fill="#0a7d4b"/><rect x="10" y="6" width="28" height="14" rx="3" fill="#0a7d4b" opacity=".55"/><path d="M18 24v12M24 24v12M30 24v12" stroke="#fff" stroke-width="3" stroke-linecap="round"/><rect x="10" y="10" width="4" height="10" fill="#a8d8c2"/><rect x="20" y="10" width="4" height="10" fill="#a8d8c2"/><rect x="30" y="10" width="4" height="10" fill="#a8d8c2"/></svg>',
+  rythu: '<svg class="biz-ic" viewBox="0 0 48 48" aria-hidden="true"><path d="M24 40V22" stroke="#0a7d4b" stroke-width="4" stroke-linecap="round"/><path d="M24 22c0-8 6-13 14-13 0 8-6 13-14 13zM10 12c6 0 11 4 12 10-7 1-12-3-12-10z" fill="#0a7d4b"/><path d="M14 40h20" stroke="#0a7d4b" stroke-width="4" stroke-linecap="round"/><path d="M18 30h12" stroke="#a8d8c2" stroke-width="3" stroke-linecap="round"/></svg>',
+};
+const BIZ_META = {
+  kirana: {
+    te: 'కిరాణా దుకాణం', en: 'Kirana shop',
+    line: 'క్రెడిట్‌పై సరుకు ఇచ్చే దుకాణం · customers on credit',
+  },
+  rythu: {
+    te: 'రైతు వ్యాపారి', en: 'Farmer-trader / aadhati',
+    line: 'రైతుల నుంచి పంట కొనుగోలు · buys produce from farmers',
+  },
+};
+function bizCard(type) {
+  const m = BIZ_META[type];
+  return `<button class="biz-card" type="button" data-biz="${type}">
+    ${BIZ_ICONS[type]}
+    <b>${m.te} · ${m.en}</b>
+    <small>${m.line}</small>
+  </button>`;
+}
+async function viewChooseType() {
+  let me = null;
+  try { me = await api('/api/me'); }
+  catch (e) { if (e.status === 401) return goLogin(); }
+  if (me) {
+    applyShop(me.shop);
+    if (me.shop && me.shop.business_type) return viewHome(); // already chosen
+  }
+  appEl().innerHTML = `
+  <div class="page">
+    <div class="mini-logo">${logoSVG()}</div>
+    <h1>మీ వ్యాపారం ఏది?</h1>
+    <p class="sub">ఒకసారి మాత్రమే ఎంచుకోవాలి · choose your business type</p>
+    <div class="biz-cards" id="bizCards">
+      ${bizCard('kirana')}
+      ${bizCard('rythu')}
+    </div>
+    <div id="bizConfirm" class="biz-confirm" hidden>
+      <p id="bizConfirmText" class="biz-confirm-text"></p>
+      <div class="biz-confirm-row">
+        <button id="bizYes" class="btn primary" type="button">అవును, ఇదే · Yes</button>
+        <button id="bizNo" class="btn ghost" type="button">వెనక్కి · Back</button>
+      </div>
+    </div>
+    <div id="bizerr" class="err" hidden></div>
+  </div>`;
+  const confirmBox = $('#bizConfirm');
+  let chosen = null;
+  $('#bizCards').querySelectorAll('[data-biz]').forEach(card => {
+    card.onclick = () => {
+      chosen = card.dataset.biz;
+      // visually mark selection via a class (no inline styles, CSP-safe)
+      document.querySelectorAll('.biz-card').forEach(c => c.classList.toggle('selected', c === card));
+      const m = BIZ_META[chosen];
+      $('#bizConfirmText').textContent = `${m.te} · ${m.en} — తర్వాత మార్చలేరు · cannot be changed after you add entries`;
+      confirmBox.hidden = false;
+      $('#bizYes').focus();
+    };
+  });
+  $('#bizNo').onclick = () => { confirmBox.hidden = true; chosen = null; };
+  $('#bizYes').onclick = async () => {
+    if (!chosen) return;
+    const err = $('#bizerr');
+    hideErr(err);
+    $('#bizYes').disabled = true;
+    try {
+      const r = await api('/api/me/business-type', { method: 'PUT', body: { business_type: chosen } });
+      applyShop(r.shop);
+      location.hash = '#/home';
+    } catch (e) {
+      $('#bizYes').disabled = false;
+      if (e.status === 401) return goLogin();
+      showErr(err, e.message);
+    }
+  };
+}
+
+// ---------- #/farmers: the rythu customers tab ----------
+async function viewFarmers() {
+  const shop = await ensureShop();
+  if (!shop) return;
+  appEl().innerHTML = `
+  ${topbar()}
+  <main class="screen">
+    <h1 class="screen-title">రైతులు <small>Farmers</small></h1>
+    <div class="ry-add-row"><button id="ryAdd" class="btn ghost wide" type="button">➕ కొత్త రైతు · New farmer</button></div>
+    <div id="ryFarmers" class="tx-list">${skelRows(3)}</div>
+    <div id="ferr" class="err" hidden></div>
+  </main>
+  ${tabbar('#/customers')}`;
+  wireTopbar();
+  $('#ryAdd').onclick = () => askRythuNewFarmer(null);
+  try {
+    await loadRythuFarmers(true);
+    renderRythuFarmers();
+  } catch (e) {
+    if (e.status === 401) return goLogin();
+    showErr($('#ferr'), e.message);
+  }
+}
+
+// ---------- #/settings: shop profile, business type (read-only), logout ----------
+const APP_VERSION = '0.3.0';
+async function viewSettings() {
+  const shop = await ensureShop();
+  if (!shop) return;
+  const s = state.shop || {};
+  appEl().innerHTML = `
+  ${topbar()}
+  <main class="screen">
+    <h1 class="screen-title">సెట్టింగ్స్ <small>Settings</small></h1>
+    <h2 class="section">దుకాణ వివరాలు · Shop profile</h2>
+    <label class="field" for="stOwner">మీ పేరు</label>
+    <input id="stOwner" class="input" maxlength="80" value="${esc(s.owner_name)}">
+    <label class="field" for="stShop">దుకాణం పేరు</label>
+    <input id="stShop" class="input" maxlength="120" value="${esc(s.shop_name)}">
+    <label class="field" for="stAddr">చిరునామా</label>
+    <textarea id="stAddr" class="input" maxlength="500" rows="3">${esc(s.address)}</textarea>
+    <div id="sterr" class="err" hidden></div>
+    <button id="stSave" class="btn primary">సేవ్ చేయండి · Save</button>
+    <p class="saved" id="stSaved" hidden>✅ సేవ్ అయింది · saved</p>
+    <h2 class="section">వ్యాపార రకం · Business type</h2>
+    <div class="card" id="stBiz">${state.mode === 'rythu'
+      ? 'రైతు వ్యాపారి · Farmer-trader (aadhati)'
+      : 'కిరాణా దుకాణం · Kirana shop'} <small>(మార్చలేరు · read-only)</small></div>
+    <h2 class="section">యాప్ · App</h2>
+    <div class="card">వెర్షన్ · Version <b>${APP_VERSION}</b></div>
+    <button id="stLogout" class="btn ghost wide">లాగ్ అవుట్ · Log out</button>
+  </main>
+  ${tabbar('#/settings')}`;
+  wireTopbar();
+  $('#stLogout').onclick = async () => { try { await api('/api/auth/logout', { method: 'POST' }); } catch (_) {} goLogin(); };
+  $('#stSave').onclick = async () => {
+    const err = $('#sterr');
+    hideErr(err);
+    $('#stSaved').hidden = true;
+    const owner_name = $('#stOwner').value.trim();
+    const shop_name = $('#stShop').value.trim();
+    const address = $('#stAddr').value.trim();
+    if (!owner_name || !shop_name || !address) return showErr(err, 'అన్ని వివరాలు తప్పనిసరి');
+    if (owner_name.length > 80 || shop_name.length > 120 || address.length > 500) {
+      return showErr(err, 'వివరాలు చాలా పొడవుగా ఉన్నాయి');
+    }
+    $('#stSave').disabled = true;
+    try {
+      const r = await api('/api/me', { method: 'PUT', body: { owner_name, shop_name, address } });
+      applyShop(r.shop);
+      $('#stSaved').hidden = false;
+      $('#stLogout').focus();
+    } catch (e) {
+      if (e.status === 401) return goLogin();
+      showErr(err, e.message);
+    }
+    $('#stSave').disabled = false;
   };
 }
 
@@ -447,12 +624,15 @@ function wireTopbar() {
   const b = $('#logout');
   if (b) b.onclick = async () => { try { await api('/api/auth/logout', { method: 'POST' }); } catch (_) {} goLogin(); };
 }
-// tab bar: always visible on the main screens
+// tab bar: the second tab and every label come from the shop's business type —
+// a rythu shop never sees kirana wording (and vice versa). Settings for both.
 function tabbar(active) {
+  const ry = state.mode === 'rythu';
   const tabs = [
     ['#/home', '🎤', 'హోమ్', 'Home'],
-    ['#/customers', '👥', 'కస్టమర్లు', 'Customers'],
+    ['#/customers', '👥', ry ? 'రైతులు' : 'కస్టమర్లు', ry ? 'Farmers' : 'Customers'],
     ['#/dashboard', '📊', 'డాష్‌బోర్డ్', 'Dashboard'],
+    ['#/settings', '⚙️', 'సెట్టింగ్స్', 'Settings'],
   ];
   return `<nav class="tabbar" aria-label="మెను">${tabs.map(([href, ic, te, en]) => `
     <a class="tab${active === href ? ' on' : ''}" href="${href}">
@@ -464,7 +644,8 @@ async function ensureShop() {
   try {
     const me = await api('/api/me');
     if (!me.profileComplete) { location.hash = '#/profile'; return null; }
-    state.shop = me.shop;
+    if (!me.shop.business_type) { location.hash = '#/choose-type'; return null; }
+    applyShop(me.shop);
     return state.shop;
   } catch (e) { if (e.status === 401) { goLogin(); return null; } throw e; }
 }
@@ -1370,27 +1551,9 @@ async function remind(c) {
 }
 
 // ================= #/home =================
-// mode chips (kirana | rythu) persisted in localStorage 'kv-mode'; the rythu
-// home replaces the kirana strip + recent list with the farmer day-summary
-function modeChips() {
-  return `<div class="mode-chips" id="modeChips" role="group" aria-label="మోడ్ · Mode">
-    <button class="mode-chip${state.mode === 'kirana' ? ' on' : ''}" type="button" data-mode="kirana">కిరాణా · Kirana</button>
-    <button class="mode-chip${state.mode === 'rythu' ? ' on' : ''}" type="button" data-mode="rythu">రైతు · Rythu</button>
-  </div>`;
-}
-function wireModeChips() {
-  const box = $('#modeChips');
-  if (!box) return;
-  box.querySelectorAll('[data-mode]').forEach(b => {
-    b.onclick = () => {
-      if (state.mode === b.dataset.mode) return;
-      state.mode = b.dataset.mode;
-      try { localStorage.setItem('kv-mode', state.mode); } catch (_) {}
-      location.hash = '#/home';
-      route();
-    };
-  });
-}
+// one experience per business type: the rythu home replaces the kirana strip +
+// recent list with the farmer day-summary. There is NO mode switch — the type
+// is chosen once during onboarding and lives on the server.
 async function viewHome() {
   const shop = await ensureShop();
   if (!shop) return;
@@ -1398,7 +1561,6 @@ async function viewHome() {
   appEl().innerHTML = `
   ${topbar()}
   <main class="screen">
-    ${modeChips()}
     ${ry
       ? `<div class="strip" id="ryStrip">${skelRows(2)}</div>
          <h2 class="section">రైతులు · Farmers</h2>
@@ -1418,7 +1580,6 @@ async function viewHome() {
   </main>
   ${tabbar('#/home')}`;
   wireTopbar();
-  wireModeChips();
   $('#mic').onclick = toggleMic;
   if (ry) $('#ryAdd').onclick = () => askRythuNewFarmer(null);
   try {
@@ -2685,7 +2846,7 @@ async function viewRythuFarmer(id) {
   </main>
   ${tabbar('#/home')}`;
   wireTopbar();
-  $('#back').onclick = () => { state.mode = 'rythu'; location.hash = '#/home'; };
+  $('#back').onclick = () => { location.hash = '#/home'; };
   renderRythuSettlements(d);
   // quick actions: 48px chips opening ONE shared form
   const forms = {
@@ -3066,51 +3227,63 @@ function wireAckActions(el, onSend, onResolved) {
 }
 
 // ================= #/dashboard — minimal numbers, no charts =================
+// one set of numbers per business type: a kirana shop sees receivables only,
+// a rythu shop sees payables/advances only — the other type never appears.
 async function viewDashboard() {
   const shop = await ensureShop();
   if (!shop) return;
+  const ry = state.mode === 'rythu';
   appEl().innerHTML = `
   ${topbar()}
   <main class="screen">
     <h1 class="screen-title">డాష్‌బోర్డ్ <small>Dashboard</small></h1>
     <div class="dash-grid">
-      <div class="card dash-card"><span class="stat-te">కిరాణాలో తీసుకోవాల్సినవి</span><span class="stat-en">Kirana receivable</span><b class="stat-val owed" id="dshKirana">…</b></div>
-      <div class="card dash-card"><span class="stat-te">రైతులకు చెల్లించాల్సినది</span><span class="stat-en">Rythu payable</span><b class="stat-val paid" id="dshRythuPay">…</b></div>
-      <div class="card dash-card"><span class="stat-te">అడ్వాన్స్ వసూలు</span><span class="stat-en">Advances to recover</span><b class="stat-val owed" id="dshRythuAdv">…</b></div>
+      ${ry
+        ? `<div class="card dash-card"><span class="stat-te">రైతులకు చెల్లించాల్సినది</span><span class="stat-en">Rythu payable</span><b class="stat-val paid" id="dshMain">…</b></div>
+           <div class="card dash-card"><span class="stat-te">అడ్వాన్స్ వసూలు</span><span class="stat-en">Advances to recover</span><b class="stat-val owed" id="dshAdv">…</b></div>`
+        : `<div class="card dash-card"><span class="stat-te">తీసుకోవాల్సినవి</span><span class="stat-en">Receivable</span><b class="stat-val owed" id="dshMain">…</b></div>`}
       <div class="card dash-card"><span class="stat-te">ఈ రోజు నమోదులు</span><span class="stat-en">Today's entries</span><b class="stat-val" id="dshToday">…</b></div>
     </div>
     <div class="card dash-card" id="dshAcks"><span class="stat-te">ధృవీకరణలు</span><span class="stat-en">Acknowledgements</span><div class="dash-ack-row" id="dshAckRow">…</div></div>
-    <div class="card dash-card"><span class="stat-te">ఎక్కువ బాకీ — మొదటి 5</span><span class="stat-en">Top 5 balances</span><div id="dshTop">${skelRows(2)}</div></div>
+    <div class="card dash-card"><span class="stat-te">ఎక్కువ ${ry ? 'చెల్లించాల్సినవి' : 'బాకీ'} — మొదటి 5</span><span class="stat-en">Top 5 ${ry ? 'payables' : 'balances'}</span><div id="dshTop">${skelRows(2)}</div></div>
     <div id="dsherr" class="err" hidden></div>
   </main>
   ${tabbar('#/dashboard')}`;
   wireTopbar();
   try {
-    const [cust, today, ry, ac] = await Promise.all([
-      api('/api/customers'),
-      api('/api/transactions?date=' + istToday()),
-      api('/api/rythu/summary').catch(() => null),
-      api('/api/acknowledgements/summary').catch(() => null),
-    ]);
-    const kirana = (cust || []).filter(c => (c.kind || 'customer') !== 'farmer');
-    let receive = 0;
-    for (const c of kirana) if (c.balance > 0) receive += Number(c.balance) || 0;
-    $('#dshKirana').textContent = fmtINR(receive);
-    $('#dshRythuPay').textContent = fmtINR((ry && ry.payable_total) || 0);
-    $('#dshRythuAdv').textContent = fmtINR((ry && ry.advance_to_recover) || 0);
+    const [cust, listP, todayP, acP] = ry
+      ? [null, api('/api/rythu/farmers'), api('/api/transactions?date=' + istToday()), api('/api/acknowledgements/summary').catch(() => null)]
+      : [api('/api/customers'), null, api('/api/transactions?date=' + istToday()), api('/api/acknowledgements/summary').catch(() => null)];
+    const [top5src, today, ac] = await Promise.all([listP, todayP, acP]);
+    if (ry) {
+      const s = await api('/api/rythu/summary');
+      $('#dshMain').textContent = fmtINR(s.payable_total || 0);
+      $('#dshAdv').textContent = fmtINR(s.advance_to_recover || 0);
+      const farmerRows = ((top5src && top5src.farmers) || []).filter(f => Number(f.payable) > 0)
+        .sort((a, b) => Number(b.payable) - Number(a.payable)).slice(0, 5);
+      $('#dshTop').innerHTML = farmerRows.length
+        ? farmerRows.map((f, i) => `<div class="tx-row"><span class="dash-rank">${i + 1}</span>
+          <span class="tx-main"><b>${esc(f.name)}</b></span>
+          <b class="tx-amt paid">${esc(fmtINR(f.payable))}</b></div>`).join('')
+        : emptyState('📊', 'ఎవరికీ చెల్లించాల్సినది లేదు · nothing payable', '');
+    } else {
+      let receive = 0;
+      for (const c of (cust || [])) if ((c.kind || 'customer') !== 'farmer' && c.balance > 0) receive += Number(c.balance) || 0;
+      $('#dshMain').textContent = fmtINR(receive);
+      const top = (cust || []).filter(c => (c.kind || 'customer') !== 'farmer' && c.balance > 0)
+        .sort((a, b) => b.balance - a.balance).slice(0, 5);
+      $('#dshTop').innerHTML = top.length
+        ? top.map((c, i) => `<div class="tx-row"><span class="dash-rank">${i + 1}</span>
+          <span class="tx-main"><b>${esc(c.name)}</b></span>
+          <b class="tx-amt owed">${esc(fmtINR(c.balance))}</b></div>`).join('')
+        : emptyState('📊', 'ఎవరికీ బాకీ లేదు · nobody owes anything', '');
+    }
     $('#dshToday').textContent = String(((today && today.transactions) || []).length);
     const acs = ac || { awaiting: 0, acknowledged: 0, disputed: 0 };
     $('#dshAckRow').innerHTML = `
       <span class="ack-chip awaiting">వేచి ${acs.awaiting}</span>
       <span class="ack-chip ok">ధృవీకరించి ${acs.acknowledged}</span>
       <span class="ack-chip disputed">వివాదం ${acs.disputed}</span>`;
-    const top = (cust || []).filter(c => c.balance > 0)
-      .sort((a, b) => b.balance - a.balance).slice(0, 5);
-    $('#dshTop').innerHTML = top.length
-      ? top.map((c, i) => `<div class="tx-row"><span class="dash-rank">${i + 1}</span>
-        <span class="tx-main"><b>${esc(c.name)}</b></span>
-        <b class="tx-amt owed">${esc(fmtINR(c.balance))}</b></div>`).join('')
-      : emptyState('📊', 'ఎవరికీ బాకీ లేదు · nobody owes anything', '');
   } catch (e) {
     if (e.status === 401) return goLogin();
     showErr($('#dsherr'), e.message);

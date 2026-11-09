@@ -464,14 +464,33 @@ h2.section { font-size: 15px; font-weight: 600; color: var(--muted); margin: 22p
 }
 
 /* ================= sprint 2: rythu mode ================= */
-/* mode chips on Home */
-.mode-chips { display: flex; gap: 8px; margin: 4px 0 12px; }
-.mode-chip {
-  flex: 1; min-height: 48px; border-radius: 14px; border: 2px solid var(--line);
-  background: #fff; color: var(--ink); font-weight: 700; font-size: 15px; cursor: pointer;
-  box-shadow: var(--sh);
+
+/* cold-start wake banner (green + non-blocking, mirrors .net-banner) */
+.wake-banner {
+  position: fixed; left: 50%; transform: translateX(-50%); top: 14px; z-index: 60;
+  background: #16324a; color: #fff; font-size: 14px; padding: 10px 16px;
+  border-radius: 18px; box-shadow: var(--sh); max-width: 92vw; text-align: center;
 }
-.mode-chip.on { background: var(--green); border-color: var(--green); color: #fff; }
+
+/* business-type choice (onboarding) */
+.biz-cards { display: flex; flex-direction: column; gap: 12px; margin: 12px 0; }
+.biz-card {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 6px;
+  text-align: left; background: #fff; border: 2px solid var(--line);
+  border-radius: 16px; padding: 16px; cursor: pointer; box-shadow: var(--sh);
+  min-height: 88px;
+}
+.biz-card.selected { border-color: var(--green); background: #eef7f1; }
+.biz-ic { width: 44px; height: 44px; }
+.biz-card b { font-size: 16px; color: var(--ink); }
+.biz-card small { color: var(--muted); font-size: 13.5px; }
+.biz-confirm { background: #fff8ec; border: 2px solid #f0c36a; border-radius: 14px; padding: 12px; margin-top: 4px; }
+.biz-confirm-text { font-weight: 700; color: #7a4b00; margin-bottom: 10px; }
+.biz-confirm-row { display: flex; gap: 10px; }
+.biz-confirm-row .btn { flex: 1; }
+
+/* settings */
+.saved { color: var(--green); font-weight: 700; margin: 6px 0 12px; }
 
 /* rythu home */
 .ry-add-row .btn { min-height: 48px; }

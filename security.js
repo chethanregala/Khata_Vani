@@ -60,6 +60,14 @@ function redactAckToken(s) {
 }
 function isAckTokenShape(s) { return TOKENISH_RE.test(String(s || '')); }
 
+// ---------- keep-alive token redaction for logs ----------
+// GET /keepalive?k=<token> carries its cron secret in the query string, so any
+// log line that might echo the URL (access logs, error dumps) must print the
+// k value as <redacted>. Same shape of guarantee as redactAckToken above.
+function redactKeepaliveToken(s) {
+  return String(s == null ? '' : s).replace(/([?&])k=[^&#]*/g, '$1k=<redacted>');
+}
+
 // ---------- same-origin / CSRF guard for browser mutations ----------
 // Signed httpOnly cookies + SameSite=Lax already block classic cross-site form
 // POSTs; this adds an explicit Origin check (covers same-site attackers, older
@@ -171,5 +179,6 @@ module.exports = {
   validateJwtSecret,
   redactAckToken,
   isAckTokenShape,
+  redactKeepaliveToken,
   CSP, // exported for tests
 };

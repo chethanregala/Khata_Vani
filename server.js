@@ -13,6 +13,7 @@ const { requestId, securityHeaders, sameOrigin, contentLength, errorHandler, val
 const money = require('./lib/money');
 const ledger = require('./lib/ledger');
 const ack = require('./lib/ack');
+const bt = require('./lib/business-type');
 const parseVoice = require('./public/parser');     // rule-based parse() (+ parseVoice.diagnose)
 const resolveName = require('./public/resolver');  // name matcher, shared with the browser
 const parseRythu = require('./public/rythu-parser'); // rythu events (+ parseRythu.diagnose)
@@ -428,7 +429,7 @@ app.post('/api/auth/challenge/answer', answerLimiter, (req, res) => {
   res.json({ voiceOkToken });
 });
 
-const SHOP_COLS = 'id, phone, owner_name, shop_name, address, voice_id, created_at';
+const SHOP_COLS = 'id, phone, owner_name, shop_name, address, voice_id, business_type, created_at';
 const profileCompleteOf = s => !!(s && s.owner_name && s.shop_name && s.address);
 
 app.post('/api/auth/signup', signupLimiter, async (req, res) => {
@@ -483,7 +484,7 @@ app.post('/api/auth/login', loginLimiter, async (req, res) => {
       return generic();
     }
     if (shop.failed_pin || shop.locked_until) await db().from('shops').update({ failed_pin: 0, locked_until: null }).eq('id', shop.id);
-    const safe = { id: shop.id, phone: shop.phone, owner_name: shop.owner_name, shop_name: shop.shop_name, address: shop.address, voice_id: shop.voice_id, created_at: shop.created_at };
+    const safe = { id: shop.id, phone: shop.phone, owner_name: shop.owner_name, shop_name: shop.shop_name, address: shop.address, voice_id: shop.voice_id, business_type: shop.business_type, created_at: shop.created_at };
     setSession(res, safe);
     res.json({ ok: true, shop: safe, profileComplete: profileCompleteOf(safe) });
   } catch (e) { fail(res, e, 'auth/login'); }
@@ -493,6 +494,41 @@ app.post('/api/auth/logout', (req, res) => { clearSession(res); res.json({ ok: t
 
 // ---- health probe (Render): no auth, returns a constant only — no secrets ----
 app.get('/healthz', (req, res) => res.json({ ok: true }));
+
+// ---------------------------------------------------------------------------
+// Keep-alive for free-tier cold starts (Render): a cron (e.g. cron-job.org,
+// every 5 minutes) pings GET /keepalive?k=<KEEPALIVE_TOKEN>. The token is
+// compared in constant time and the k value is NEVER echoed or logged; a
+// wrong/missing token (or a server with no token configured) reads as the
+// same generic 404 that every unknown route gets. The body confirms load-out
+// with one cheap Supabase read so the DB pool stays warm too. /healthz above
+// stays public, secret-free and needs no env.
+// ---------------------------------------------------------------------------
+const KEEPALIVE_TOKEN = String(E.KEEPALIVE_TOKEN || '').trim();
+const keepaliveLimiter = rateLimit({
+  windowMs: 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false,
+  message: { error: 'రూట్ దొరకలేదు · route not found' }, // generic: no rate/bucket hints
+  keyGenerator: req => ipKeyGenerator(req.ip),
+});
+// length-independent constant-time compare (hash both sides to fixed size)
+function safeEqual(a, b) {
+  const ha = crypto.createHash('sha256').update(String(a == null ? '' : a), 'utf8').digest();
+  const hb = crypto.createHash('sha256').update(String(b == null ? '' : b), 'utf8').digest();
+  return crypto.timingSafeEqual(ha, hb);
+}
+app.get('/keepalive', keepaliveLimiter, async (req, res) => {
+  const k = req.query.k;
+  if (!KEEPALIVE_TOKEN || typeof k !== 'string' || !safeEqual(k, KEEPALIVE_TOKEN)) {
+    return res.status(404).json({ error: 'రూట్ దొరకలేదు · route not found' });
+  }
+  try {
+    // the one cheap read keeps the Supabase connection warm; a failure must
+    // still answer ok (cron wants the app awake, not a DB status report) and
+    // is logged without any request data
+    await db().from('shops').select('id').limit(1);
+  } catch (_) {}
+  res.json({ ok: true });
+});
 
 // ---------------------------------------------------------------------------
 // Sprint 3 — PUBLIC customer-acknowledgement endpoints (no auth, NO COOKIES:
@@ -602,6 +638,37 @@ function requireAuth(req, res, next) {
 }
 app.use('/api', requireAuth);
 
+// ---- business-type separation (kirana vs rythu) --------------------------
+// A shop that has not chosen a business type is blocked from every ledger
+// route (403 BUSINESS_TYPE_REQUIRED) until it does; once chosen, the type
+// decides which routes / kinds / workflows the shop may touch. /api/me and
+// PUT /api/me/business-type stay open so onboarding can complete.
+const BIZ_REQUIRED = { error: 'వ్యాపార రకం ఎంచుకోండి · choose your business type', code: 'BUSINESS_TYPE_REQUIRED' };
+const BIZ_MISMATCH = { error: 'ఈ రూట్ మీ దుకాణ రకానికి అందుబాటులో లేదు · not available for your business type', code: 'BUSINESS_TYPE_MISMATCH' };
+// load the shop's current business_type once per request (the JWT carries
+// none, so a newly-chosen type takes effect immediately without re-login)
+async function loadBiz(req) {
+  if (req.shop.business_type !== undefined) return req.shop.business_type;
+  const { data, error } = await db().from('shops').select('business_type').eq('id', req.shop.id).single();
+  if (error) throw error;
+  req.shop.business_type = data ? data.business_type : null;
+  return req.shop.business_type;
+}
+function requireBizType(req, res, next) {
+  loadBiz(req).then(v => {
+    if (!bt.isValid(v)) return res.status(403).json(BIZ_REQUIRED);
+    next();
+  }).catch(e => fail(res, e, 'biz-type/load'));
+}
+// route-scoped guard: e.g. a kirana shop can never call /api/rythu/*
+const onlyBiz = t => function requireBiz(req, res, next) {
+  requireBizType(req, res, () => {
+    if (req.shop.business_type !== t) return res.status(403).json(BIZ_MISMATCH);
+    next();
+  });
+};
+const rythuOnly = onlyBiz('rythu');
+
 app.get('/api/me', async (req, res) => {
   try {
     const { data, error } = await db().from('shops').select(SHOP_COLS).eq('id', req.shop.id).single();
@@ -626,6 +693,34 @@ app.put('/api/me', async (req, res) => {
     if (error) throw error;
     res.json({ shop: data, profileComplete: true });
   } catch (e) { fail(res, e, 'me/put'); }
+});
+
+// PUT /api/me/business-type { business_type } — the one-time onboarding choice.
+// Allowed while the type is still null OR the shop has zero transactions; once
+// entries exist the evidence locks the choice (409 BUSINESS_TYPE_LOCKED).
+app.put('/api/me/business-type', async (req, res) => {
+  const v = String((req.body || {}).business_type || '').trim();
+  if (!bt.isValid(v)) return res.status(400).json({ error: 'వ్యాపార రకం "kirana" లేదా "rythu" కావాలి', code: 'BAD_BUSINESS_TYPE' });
+  try {
+    const [sq, tq] = await Promise.all([
+      db().from('shops').select('business_type').eq('id', req.shop.id).single(),
+      db().from('transactions').select('id', { count: 'exact', head: true }).eq('shop_id', req.shop.id),
+    ]);
+    if (sq.error) throw sq.error;
+    if (tq.error) throw tq.error;
+    const cur = sq.data ? sq.data.business_type : null;
+    const locked = bt.changeRule(cur, tq.count);
+    if (locked) {
+      return res.status(409).json({
+        error: 'ఎంట్రీల తర్వాత వ్యాపార రకం మార్చలేరు · cannot change after entries exist',
+        code: locked,
+      });
+    }
+    const { data, error } = await db().from('shops')
+      .update({ business_type: v }).eq('id', req.shop.id).select(SHOP_COLS).single();
+    if (error) throw error;
+    res.json({ ok: true, shop: data });
+  } catch (e) { fail(res, e, 'me/business-type'); }
 });
 
 // ---- STT (Gnani Prisma proxy: auth + per-shop limit + timeout, no raw
@@ -711,8 +806,8 @@ app.post('/api/tts', ttsApiLimiter, contentLength(8 * 1024), async (req, res) =>
   res.type('audio/wav').send(out.buffer);
 });
 
-// ---- LEDGER (all scoped to the session shop) ----
-app.get('/api/customers', async (req, res) => {
+// ---- LEDGER (all scoped to the session shop; business-type gated) ----
+app.get('/api/customers', requireBizType, async (req, res) => {
   try {
     const [c, t] = await Promise.all([
       db().from('customers').select('id, name, label, phone, aliases, kind, village, created_at')
@@ -740,13 +835,16 @@ app.get('/api/customers', async (req, res) => {
   } catch (e) { fail(res, e, 'customers/get'); }
 });
 
-app.post('/api/customers', async (req, res) => {
+app.post('/api/customers', requireBizType, async (req, res) => {
   const b = req.body || {};
   const name = String(b.name == null ? '' : b.name).trim().replace(/\s+/g, ' ');
   const label = b.label != null && String(b.label).trim() !== '' ? String(b.label).trim() : null;
   const phone = b.phone != null && String(b.phone).trim() !== '' ? String(b.phone).trim() : null;
-  // rythu mode creates kind='farmer' customers; kirana stays kind='customer'
-  const kind = b.kind === 'farmer' ? 'farmer' : 'customer';
+  // each business type creates exactly its own kind of counterparty: kirana
+  // -> kind='customer', rythu -> kind='farmer'. Asking for the other kind is
+  // a 403, and the default is derived server-side (never from the client).
+  const kind = bt.kindOf(req.shop.business_type);
+  if (b.kind != null && b.kind !== kind) return res.status(403).json({ ...BIZ_MISMATCH });
   const village = b.village != null && String(b.village).trim() !== ''
     ? String(b.village).trim().slice(0, 60) : null;
   if (!name) return res.status(400).json({ error: 'కస్టమర్ పేరు తప్పనిసరి' });
@@ -767,7 +865,7 @@ app.post('/api/customers', async (req, res) => {
 // The client first previews via POST /api/voice/propose (this route writes
 // nothing) and then confirms here with the idempotency key from the preview.
 // Retrying the same key can never create a second row (shop_id+key unique).
-app.post('/api/transactions', async (req, res) => {
+app.post('/api/transactions', requireBizType, async (req, res) => {
   const b = req.body || {};
   try {
     const row = {
@@ -789,6 +887,11 @@ app.post('/api/transactions', async (req, res) => {
         ? b.idempotency_key : crypto.randomUUID(),
       source: b.source === 'screen' ? 'screen' : 'voice',
     };
+    // business-type separation on the ledger itself: a kirana shop can never
+    // post rythu/dairy rows and a rythu shop can never post kirana rows
+    if (row.workflow !== bt.workflowOf(req.shop.business_type)) {
+      return res.status(403).json({ ...BIZ_MISMATCH });
+    }
     const out = await ledger.postTransactions(req.shop.id, [row]);
     const posted = out && out[0];
     if (!posted) throw Object.assign(new Error('no row'), { code: 'LEDGER_RPC' });
@@ -797,7 +900,7 @@ app.post('/api/transactions', async (req, res) => {
 });
 
 // ---- reverse: undo a mistake with ONE offsetting row (never a hard delete) ----
-app.post('/api/transactions/:id/reverse', async (req, res) => {
+app.post('/api/transactions/:id/reverse', requireBizType, async (req, res) => {
   const reason = String((req.body || {}).reason == null ? '' : (req.body || {}).reason).trim();
   if (!reason) return res.status(400).json({ error: 'రద్దు కారణం తప్పనిసరి · reason required' });
   try {
@@ -872,7 +975,7 @@ function buildRythuEntries(parts, roster) {
   return out;
 }
 
-app.post('/api/voice/propose', async (req, res) => {
+app.post('/api/voice/propose', requireBizType, async (req, res) => {
   const b = req.body || {};
   if (typeof b.transcript !== 'string' || !b.transcript.trim()) {
     return res.status(400).json({ error: 'మాట లేదు · transcript required' });
@@ -881,7 +984,10 @@ app.post('/api/voice/propose', async (req, res) => {
     return res.status(400).json({ error: 'వాక్యం చాలా పొడవుగా ఉంది · sentence too long' });
   }
   try {
-    if (b.workflow === 'rythu') {
+    // the workflow comes from the SHOP's business type — any client-supplied
+    // workflow is ignored, so one shop can never parse as the other type
+    const wf = bt.workflowOf(req.shop.business_type);
+    if (wf === 'rythu') {
       // -- rythu: resolution runs against kind='farmer' ONLY so the same name
       // in the two modes never collides --
       const customers = await db().from('customers')
@@ -1006,7 +1112,7 @@ const squeeze = v => String(v == null ? '' : v).trim().replace(/\s+/g, ' ');
 
 // PATCH /api/customers/:id — edit name / label / phone / aliases / village.
 // kind is intentionally NOT settable here — mode flips only at creation.
-app.patch('/api/customers/:id', async (req, res) => {
+app.patch('/api/customers/:id', requireBizType, async (req, res) => {
   const b = req.body || {};
   try {
     const cur = await ownCustomer(req, req.params.id);
@@ -1055,7 +1161,7 @@ app.patch('/api/customers/:id', async (req, res) => {
 });
 
 // POST /api/customers/merge — move remove_id's transactions onto keep_id, then delete it
-app.post('/api/customers/merge', async (req, res) => {
+app.post('/api/customers/merge', requireBizType, async (req, res) => {
   const b = req.body || {};
   const keepId = String(b.keep_id || ''), removeId = String(b.remove_id || '');
   if (!keepId || !removeId) return res.status(400).json({ error: 'రెండు కస్టమర్ల ఐడీలు కావాలి' });
@@ -1085,7 +1191,7 @@ app.post('/api/customers/merge', async (req, res) => {
 });
 
 // GET /api/customers/:id/transactions — that customer's entries, newest first
-app.get('/api/customers/:id/transactions', async (req, res) => {
+app.get('/api/customers/:id/transactions', requireBizType, async (req, res) => {
   try {
     const c = await ownCustomer(req, req.params.id);
     if (!c) return res.status(404).json({ error: 'కస్టమర్ దొరకలేదు' });
@@ -1121,7 +1227,7 @@ function istDayRange(date) {
   return { start, end: new Date(start.getTime() + 24 * 60 * 60 * 1000) };
 }
 
-app.get('/api/transactions', async (req, res) => {
+app.get('/api/transactions', requireBizType, async (req, res) => {
   // ?recent=N -> the shop's last N entries across all days (Home screen)
   if (req.query.recent !== undefined) {
     const n = parseInt(String(req.query.recent), 10);
@@ -1162,22 +1268,22 @@ app.get('/api/transactions', async (req, res) => {
 // Farmers are customers with kind='farmer'. Every route is session-shop-scoped
 // through the ledger; summaries are computed on read, never stored.
 
-// GET /api/rythu/farmers — the rythu customer list
-app.get('/api/rythu/farmers', async (req, res) => {
+// GET /api/rythu/farmers — the rythu customer list (rythu shops only)
+app.get('/api/rythu/farmers', rythuOnly, async (req, res) => {
   try {
     res.json({ farmers: await ledger.rythuFarmers(req.shop.id) });
   } catch (e) { ledgerFail(res, e, 'rythu/farmers'); }
 });
 
 // GET /api/rythu/farmers/:id/settlements — settlement cards + unallocated list
-app.get('/api/rythu/farmers/:id/settlements', async (req, res) => {
+app.get('/api/rythu/farmers/:id/settlements', rythuOnly, async (req, res) => {
   try {
     res.json(await ledger.farmerSettlements(req.shop.id, String(req.params.id)));
   } catch (e) { ledgerFail(res, e, 'rythu/settlements'); }
 });
 
 // GET /api/rythu/summary — the rythu Home strip for one IST day
-app.get('/api/rythu/summary', async (req, res) => {
+app.get('/api/rythu/summary', rythuOnly, async (req, res) => {
   const day = typeof req.query.date === 'string' && req.query.date ? req.query.date : undefined;
   try {
     res.json(await ledger.rythuSummary(req.shop.id, day));
@@ -1186,7 +1292,7 @@ app.get('/api/rythu/summary', async (req, res) => {
 
 // POST /api/transactions/:id/allocate { settlement_id } — apply an unallocated
 // advance/deduction/payment to a settlement (null -> id, the only linkage move)
-app.post('/api/transactions/:id/allocate', async (req, res) => {
+app.post('/api/transactions/:id/allocate', rythuOnly, async (req, res) => {
   const settlementId = (req.body || {}).settlement_id;
   if (!settlementId) return res.status(400).json({ error: 'సెటిల్‌మెంట్ ఎంపిక తప్పనిసరి · settlement required' });
   try {
@@ -1206,7 +1312,7 @@ app.post('/api/transactions/:id/allocate', async (req, res) => {
 // link for the entry is revoked first; the response carries the raw token
 // exactly ONCE. A Telugu summary is pre-synthesized (best-effort) into the
 // disk cache keyed by the token hash.
-app.post('/api/transactions/:id/ack-link', async (req, res) => {
+app.post('/api/transactions/:id/ack-link', requireBizType, async (req, res) => {
   try {
     const { token, hash, tx } = await ack.createLink(req.shop.id, String(req.params.id));
     // the shareable URL: APP_ORIGIN first, fall back to the request's own host
@@ -1232,7 +1338,7 @@ app.post('/api/transactions/:id/ack-link', async (req, res) => {
 // disputed acknowledgement as resolved (ack_status becomes 'resolved').
 // Audited. The optional note is accepted for API clarity but has no storage
 // column — the customer's dispute_note stays untouched.
-app.post('/api/transactions/:id/ack-resolve', async (req, res) => {
+app.post('/api/transactions/:id/ack-resolve', requireBizType, async (req, res) => {
   const note = String(((req.body || {}).note) == null ? '' : req.body.note).trim();
   if (note.length > 200) return res.status(400).json({ error: 'సందేశం చాలా పొడవు · note too long' });
   try {
@@ -1242,7 +1348,7 @@ app.post('/api/transactions/:id/ack-resolve', async (req, res) => {
 
 // GET /api/acknowledgements/summary — counts of awaiting / acknowledged /
 // disputed for this shop (dashboard strip).
-app.get('/api/acknowledgements/summary', async (req, res) => {
+app.get('/api/acknowledgements/summary', requireBizType, async (req, res) => {
   try {
     res.json(await ack.shopSummary(req.shop.id));
   } catch (e) { ledgerFail(res, e, 'ack/summary'); }
@@ -1250,7 +1356,7 @@ app.get('/api/acknowledgements/summary', async (req, res) => {
 
 // GET /api/transactions/:id/ack — the shop reads ONE entry's acknowledgement
 // detail (status + the customer's dispute note; a red chip shows it back)
-app.get('/api/transactions/:id/ack', async (req, res) => {
+app.get('/api/transactions/:id/ack', requireBizType, async (req, res) => {
   try {
     const info = await ack.info(req.shop.id, String(req.params.id));
     if (!info) return res.status(404).json({ error: 'ధృవీకరణ లేదు · no acknowledgement', code: 'NOT_FOUND' });

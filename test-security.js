@@ -53,7 +53,7 @@ global.fetch = async (url, opts) => {
 };
 
 const { app } = require('./server.js');
-const { validateJwtSecret, CSP, redactAckToken, isAckTokenShape } = require('./security.js');
+const { validateJwtSecret, CSP, redactAckToken, isAckTokenShape, redactKeepaliveToken } = require('./security.js');
 
 let pass = 0, fail = 0;
 function check(what, cond, detail) {
@@ -453,6 +453,43 @@ let PORT = 0;
       scrubRun.out.slice(-400));
     check('no-store log line carries the redacted path only',
       scrubRun.out.indexOf("/a/<redacted>") !== -1, scrubRun.out.slice(-400));
+  }
+
+  // ================= Keep-alive (cron secret) =================
+  check('unit: redactKeepaliveToken redacts k= in any logged URL',
+    redactKeepaliveToken('GET /keepalive?k=TOPSECRET&other=1') === 'GET /keepalive?k=<redacted>&other=1',
+    redactKeepaliveToken('GET /keepalive?k=TOPSECRET&other=1'));
+  check('unit: redactKeepaliveToken handles missing k',
+    redactKeepaliveToken('GET /keepalive') === 'GET /keepalive');
+  const kaTok = 'ka-' + crypto.randomBytes(24).toString('base64url');
+  const kaPort = await freePort();
+  const kaRun = await runServer({ JWT_SECRET: crypto.randomBytes(48).toString('hex'), PORT: String(kaPort), KEEPALIVE_TOKEN: kaTok });
+  check('keepalive server starts', !!kaRun.started, kaRun.out.slice(0, 200));
+  if (kaRun.started) {
+    const ka = async q => realFetch('http://127.0.0.1:' + kaPort + q);
+    const missing = await ka('/keepalive');
+    const wrong = await ka('/keepalive?k=wrong-token');
+    check('keepalive: wrong/missing token -> generic 404',
+      missing.status === 404 && wrong.status === 404, missing.status + '/' + wrong.status);
+    // bodies re-fetched freshly for a clean comparison
+    const m2 = await realFetch('http://127.0.0.1:' + kaPort + '/keepalive');
+    const w2 = await realFetch('http://127.0.0.1:' + kaPort + '/keepalive?k=wrong');
+    const mb = await m2.json(); const wb = await w2.json();
+    check('keepalive: 404 bodies are generic and identical',
+      m2.status === 404 && w2.status === 404 && JSON.stringify(mb) === JSON.stringify(wb),
+      JSON.stringify(wb));
+    const right = await ka('/keepalive?k=' + encodeURIComponent(kaTok));
+    const rb = right.ok ? await right.json() : null;
+    check('keepalive: right token -> {ok:true}', right.status === 200 && rb && rb.ok === true, JSON.stringify(rb));
+    // /healthz stays public and secret-free
+    const hk = await ka('/healthz');
+    const hb = hk.ok ? await hk.json() : null;
+    check('healthz: public, {ok:true} only, no secret', hk.status === 200 &&
+      JSON.stringify(hb).indexOf(kaTok) === -1 && JSON.stringify(hb) === '{"ok":true}', JSON.stringify(hb));
+    kaRun.child.kill();
+    await new Promise(res => setTimeout(res, 800));
+    check('keepalive: k token never printed in server logs',
+      kaRun.out.indexOf(kaTok) === -1, kaRun.out.slice(-300));
   }
 
   console.log(`\n${pass} passed, ${fail} failed`);

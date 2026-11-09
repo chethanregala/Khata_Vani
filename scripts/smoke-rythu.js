@@ -80,6 +80,7 @@ function stepFail(name, status) {
   const shopId = crypto.randomUUID(); // tracking key ONLY for the fallback sweep
   let realShopId = null;
   let realShop2Id = null;
+  let realShop3Id = null;
   try {
     // ---- 1. signup through the real auth flow ----
     // valid: starts with 9, ten digits; the number itself is NEVER printed
@@ -92,12 +93,48 @@ function stepFail(name, status) {
     if (!realShopId) throw up.out;
     ok('signup created a session (cookie set)', !!cookie && !!up.data.shop);
 
+    // ---- 1b. profile + the one-time business-type choice (rythu) ----
+    const profA = await reqJSON('profile-set', 'PUT', '/api/me', {
+      owner_name: '__smoke owner', shop_name: '__SMOKE shop ' + crypto.randomUUID().slice(0, 8),
+      address: '__smoke address',
+    });
+    if (!profA.res.ok) throw profA.out;
+    const ws = await reqJSON('biz-required', 'GET', '/api/customers');
+    ok('null business type blocked from ledger routes (403 REQUIRED)',
+      !ws.res.ok && ws.res.status === 403 && ws.out.code === 'BUSINESS_TYPE_REQUIRED',
+      ws.res.status + '/' + ws.out.code);
+    const badT = await reqJSON('biz-bad-type', 'PUT', '/api/me/business-type', { business_type: 'dairy' });
+    ok('invalid business type rejected (400)', !badT.res.ok && badT.res.status === 400, badT.res.status);
+    const chooseA = await reqJSON('biz-choose-rythu', 'PUT', '/api/me/business-type', { business_type: 'rythu' });
+    if (!chooseA.res.ok) throw chooseA.out;
+    ok('rythu type chosen for shop A', !!(chooseA.data && chooseA.data.shop &&
+      chooseA.data.shop.business_type === 'rythu'));
+
     // ---- 2. farmer customer (kind='farmer') ----
     const fname = '__SMOKE farmer ' + crypto.randomUUID().slice(0, 8);
     const fc = await reqJSON('create-farmer', 'POST', '/api/customers', { name: fname, village: '__smoke', kind: 'farmer' });
     if (!fc.res.ok || !fc.res.status) throw fc.out;
     const farmerId = fc.data && (fc.data.id || (fc.data.customer && fc.data.customer.id));
     ok('farmer created with an id', !!farmerId);
+
+    // ---- 2b. separation guards: a rythu shop never acts kirana ----
+    const kcust = await reqJSON('create-kirana-rejected', 'POST', '/api/customers',
+      { name: '__SMOKE kirana ' + crypto.randomUUID().slice(0, 8), kind: 'customer' });
+    ok('rythu shop creating kind=customer rejected (403)',
+      !kcust.res.ok && kcust.res.status === 403 && kcust.out.code === 'BUSINESS_TYPE_MISMATCH',
+      kcust.res.status + '/' + kcust.out.code);
+    const kpost = await reqJSON('kirana-row-rejected', 'POST', '/api/transactions', {
+      customer_id: farmerId, workflow: 'kirana', direction: 'receivable', type: 'credit',
+      event: 'goods_credit', amount: 10, idempotency_key: crypto.randomUUID(), source: 'screen',
+    });
+    ok('rythu shop posting a kirana row rejected (403)',
+      !kpost.res.ok && kpost.res.status === 403 && kpost.out.code === 'BUSINESS_TYPE_MISMATCH',
+      kpost.res.status + '/' + kpost.out.code);
+    // propose ignores the client-supplied workflow: this shop parses as rythu
+    const ppA = await reqJSON('propose-workflow', 'POST', '/api/voice/propose',
+      { transcript: 'nothing that parses here', workflow: 'kirana' });
+    ok('shop A propose derived rythu (client workflow ignored)',
+      ppA.res.ok && ppA.data && ppA.data.workflow === 'rythu');
 
     // ---- 3. delivery exactly like the browser's postRythu ----
     const key = crypto.randomUUID();
@@ -147,6 +184,28 @@ function stepFail(name, status) {
     const sm = await fetch(BASE + '/api/rythu/summary', { headers: { Cookie: cookie } });
     ok('rythu summary readable without error', sm.ok);
 
+    // ================= second shop: a KIRANA shop for the ack flow =================
+    const phoneB = '9' + String((Date.now() + 3) % 1000000000).padStart(9, '0');
+    const tokB = jwt.sign({ phone: phoneB, purpose: 'voiceOk' }, JWT_SECRET, { expiresIn: '5m' });
+    cookie = null;
+    const upB = await reqJSON('signup-kirana', 'POST', '/api/auth/signup', { phone: phoneB, pin: '1234', voiceOkToken: tokB });
+    if (!upB.res.ok) throw upB.out;
+    realShop2Id = upB.data && upB.data.shop && upB.data.shop.id;
+    const profB = await reqJSON('profile-set-b', 'PUT', '/api/me', {
+      owner_name: '__smoke owner B', shop_name: '__SMOKE shop ' + crypto.randomUUID().slice(0, 8),
+      address: '__smoke address B',
+    });
+    if (!profB.res.ok) throw profB.out;
+    const chooseB = await reqJSON('biz-choose-kirana', 'PUT', '/api/me/business-type', { business_type: 'kirana' });
+    if (!chooseB.res.ok) throw chooseB.out;
+    const rf = await reqJSON('ry-route-rejected', 'GET', '/api/rythu/farmers');
+    ok('kirana shop cannot call /api/rythu/* (403 MISMATCH)',
+      !rf.res.ok && rf.res.status === 403 && rf.out.code === 'BUSINESS_TYPE_MISMATCH',
+      rf.res.status + '/' + rf.out.code);
+    const bfarmer = await reqJSON('create-farmer-rejected-b', 'POST', '/api/customers',
+      { name: '__SMOKE farmer B ' + crypto.randomUUID().slice(0, 8), kind: 'farmer' });
+    ok('kirana shop cannot create kind=farmer (403 MISMATCH)',
+      !bfarmer.res.ok && bfarmer.res.status === 403 && bfarmer.out.code === 'BUSINESS_TYPE_MISMATCH');
     // ================= sprint 3: acknowledgement flow (kirana) =================
     // ---- 6. shop profile: the public page shows the SHOP NAME ----
     const shopName = '__SMOKE shop ' + crypto.randomUUID().slice(0, 8);
@@ -336,21 +395,31 @@ function stepFail(name, status) {
     ok('customer balance equals the ledger sum over all rows',
       !!custRow && Number(custRow.balance) === sumP, 'sum=' + sumP);
 
-    // ---- 19. cross-shop isolation: a second shop cannot touch shop A's rows ----
-    const cookieA = cookie;
+    // ---- 19. cross-shop isolation: a second shop cannot touch shop B's rows ----
+    const cookieB = cookie;
     const phone2 = '9' + String((Date.now() + 7) % 1000000000).padStart(9, '0');
-    const tokB = jwt.sign({ phone: phone2, purpose: 'voiceOk' }, JWT_SECRET, { expiresIn: '5m' });
+    const tokC = jwt.sign({ phone: phone2, purpose: 'voiceOk' }, JWT_SECRET, { expiresIn: '5m' });
     cookie = null;
-    const up2 = await reqJSON('signup-b', 'POST', '/api/auth/signup', { phone: phone2, pin: '1234', voiceOkToken: tokB });
+    const up2 = await reqJSON('signup-c', 'POST', '/api/auth/signup', { phone: phone2, pin: '1234', voiceOkToken: tokC });
     if (!up2.res.ok) throw up2.out;
-    realShop2Id = up2.data && up2.data.shop && up2.data.shop.id;
+    realShop3Id = up2.data && up2.data.shop && up2.data.shop.id;
+    // a shop that has not chosen: nothing ledger-ish works yet (403 REQUIRED)
+    const isoPre = await fetch(BASE + '/api/customers/' + kid + '/transactions', { headers: { Cookie: cookie } });
+    ok('untyped cross-shop timeline reads as 403 REQUIRED', isoPre.status === 403, isoPre.status);
+    const profC = await reqJSON('profile-set-c', 'PUT', '/api/me', {
+      owner_name: '__smoke owner C', shop_name: '__SMOKE shop ' + crypto.randomUUID().slice(0, 8),
+      address: '__smoke address C',
+    });
+    if (!profC.res.ok) throw profC.out;
+    const chooseC = await reqJSON('biz-choose-kirana-c', 'PUT', '/api/me/business-type', { business_type: 'kirana' });
+    if (!chooseC.res.ok) throw chooseC.out;
     const isoT = await fetch(BASE + '/api/customers/' + kid + '/transactions', { headers: { Cookie: cookie } });
     ok('cross-shop customer timeline reads as 404', isoT.status === 404, isoT.status);
     const isoRev = await reqJSON('cross-shop-reverse', 'POST', '/api/transactions/' + p1.data.id + '/reverse', { reason: 'smoke iso' });
     ok('cross-shop reverse rejected', !isoRev.res.ok && isoRev.res.status === 404, isoRev.res.status);
     const isoAck = await reqJSON('cross-shop-ack', 'POST', '/api/transactions/' + entryId + '/ack-link', {});
     ok('cross-shop ack-link rejected', !isoAck.res.ok && isoAck.res.status === 404, isoAck.res.status);
-    cookie = cookieA; // back to shop A's session for any later steps
+    cookie = cookieB; // back to shop B's session for any later steps
 
     console.log('\n[smoke] EVERY STEP PASSED — rythu save works against the real server');
   } catch (e) {
@@ -372,10 +441,17 @@ function stepFail(name, status) {
         await del('shop', 'shops', 'id', realShopId);
       }
       if (realShop2Id) {
+        await del('acknowledgements-2', 'acknowledgements', 'shop_id', realShop2Id);
         await del('audit-events-2', 'audit_events', 'shop_id', realShop2Id);
         await del('transactions-2', 'transactions', 'shop_id', realShop2Id);
         await del('customers-2', 'customers', 'shop_id', realShop2Id);
         await del('shop-2', 'shops', 'id', realShop2Id);
+      }
+      if (realShop3Id) {
+        await del('audit-events-3', 'audit_events', 'shop_id', realShop3Id);
+        await del('transactions-3', 'transactions', 'shop_id', realShop3Id);
+        await del('customers-3', 'customers', 'shop_id', realShop3Id);
+        await del('shop-3', 'shops', 'id', realShop3Id);
       }
       // safety net: the signup SUCCEEDED but the response parsing failed
       // (then-shop-id sweep keyed by the random phone is unnecessary —

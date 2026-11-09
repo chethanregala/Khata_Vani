@@ -1,14 +1,17 @@
 'use strict';
-// Demo shop only. Idempotent: a second `npm run seed` reuses the same rows
-// (stable idempotency keys). `npm run seed:clean` deletes that phone only.
+// Two demo shops. Idempotent: a second `npm run seed` reuses the same rows
+// (stable idempotency keys). `npm run seed:clean` deletes ONLY these two.
 require('dotenv').config();
 const bcrypt = require('bcryptjs');
 const { createClient } = require('@supabase/supabase-js');
 const ledger = require('../lib/ledger');
 
-const PHONE = '9000000001';
 const PIN = '1234';
 const CLEAN = process.argv.indexOf('--clean') !== -1;
+const SHOPS = [
+  { phone: '9000000001', business_type: 'kirana', shop_name: 'Demo Kirana' },
+  { phone: '9000000002', business_type: 'rythu', shop_name: 'Demo Rythu' },
+];
 
 const E = process.env;
 const SB_URL = E.SUPABASE_URL || '';
@@ -30,8 +33,8 @@ function fail(e) {
   process.exit(1);
 }
 
-async function shopRow() {
-  const r = await sb.from('shops').select('id').eq('phone', PHONE).limit(1);
+async function shopRow(phone) {
+  const r = await sb.from('shops').select('id').eq('phone', phone).limit(1);
   if (r.error) throw r.error;
   return (r.data && r.data[0]) || null;
 }
@@ -45,19 +48,21 @@ async function wipe(id) {
   if (s.error) throw s.error;
 }
 
-async function ensureShop() {
-  const existing = await shopRow();
+async function ensureShop(def) {
+  const existing = await shopRow(def.phone);
   if (existing) {
     const u = await sb.from('shops').update({
-      owner_name: 'Demo Owner', shop_name: 'Demo Kirana', address: 'Demo Street',
+      owner_name: 'Demo Owner', shop_name: def.shop_name, address: 'Demo Street',
+      business_type: def.business_type,
     }).eq('id', existing.id);
     if (u.error) throw u.error;
     return existing.id;
   }
   const pin_hash = await bcrypt.hash(PIN, 10);
   const ins = await sb.from('shops').insert({
-    phone: PHONE, pin_hash, owner_name: 'Demo Owner', shop_name: 'Demo Kirana',
-    address: 'Demo Street', failed_pin: 0, created_at: new Date().toISOString(),
+    phone: def.phone, pin_hash, owner_name: 'Demo Owner', shop_name: def.shop_name,
+    address: 'Demo Street', business_type: def.business_type, failed_pin: 0,
+    created_at: new Date().toISOString(),
   }).select('id').single();
   if (ins.error) throw ins.error;
   return ins.data.id;
@@ -96,13 +101,17 @@ async function stampCustomer(id, days) {
 (async () => {
   try {
     if (CLEAN) {
-      const row = await shopRow();
-      if (row) await wipe(row.id);
-      console.log('seed:clean done phone=' + PHONE);
+      let wiped = 0;
+      for (const def of SHOPS) {
+        const row = await shopRow(def.phone);
+        if (row) { await wipe(row.id); wiped++; }
+      }
+      console.log('seed:clean done shops=' + wiped);
       return;
     }
-    const shopId = await ensureShop();
 
+    // ---- shop 1: Demo Kirana (credit customers only) ----
+    const kiranaId = await ensureShop(SHOPS[0]);
     const kirana = [
       { name: 'రమేష్', label: 'టైలర్', kind: 'customer', days: 45 },
       { name: 'రమేష్', label: 'పాలవాడు', kind: 'customer', days: 2 },
@@ -114,20 +123,12 @@ async function stampCustomer(id, days) {
       { name: 'ప్రియ', kind: 'customer', days: 1 },
     ];
     const ids = {};
-    for (const c of kirana) ids[c.label ? c.name + '|' + c.label : c.name] = await ensureCustomer(shopId, c);
-    const farmers = [
-      { name: 'సురేష్', kind: 'farmer', village: 'డెమోపల్లి', days: 20 },
-      { name: 'లక్ష్మి', kind: 'farmer', village: 'ఊరు-ఎ', days: 20 },
-      { name: 'వెంకట్', kind: 'farmer', village: 'ఊరు-బి', days: 20 },
-    ];
-    for (const c of farmers) ids['f|' + c.name] = await ensureCustomer(shopId, c);
-    for (const c of kirana.concat(farmers)) {
-      if (c.days > 30) await stampCustomer(ids[c.label ? c.name + '|' + c.label : (c.kind === 'farmer' ? 'f|' + c.name : c.name)], c.days);
+    for (const c of kirana) ids[c.label ? c.name + '|' + c.label : c.name] = await ensureCustomer(kiranaId, c);
+    for (const c of kirana) {
+      if (c.days > 30) await stampCustomer(ids[c.label ? c.name + '|' + c.label : c.name], c.days);
     }
-
     const K = (key, who, type, amount, days, event) => ({
-      key, who, type, amount, days, event,
-      workflow: 'kirana', direction: 'receivable',
+      key, who, type, amount, days, event, workflow: 'kirana', direction: 'receivable',
     });
     const kiranaRows = [
       K('seed-k-01', 'రమేష్|టైలర్', 'credit', 500, 45, 'goods_credit'),
@@ -157,17 +158,28 @@ async function stampCustomer(id, days) {
       K('seed-k-25', 'ప్రియ', 'pay', 40, 1, 'repayment'),
     ];
     for (const row of kiranaRows) {
-      await post(shopId, {
+      await post(kiranaId, {
         customer_id: ids[row.who], type: row.type, amount: row.amount,
         workflow: row.workflow, direction: row.direction, event: row.event,
         idempotency_key: row.key, source: 'screen',
       });
-      await stampTx(shopId, row.key, row.days);
+      await stampTx(kiranaId, row.key, row.days);
     }
 
+    // ---- shop 2: Demo Rythu (3 farmers + settlements) ----
+    const rythuId = await ensureShop(SHOPS[1]);
+    const farmers = [
+      { name: 'సురేష్', kind: 'farmer', village: 'డెమోపల్లి', days: 20 },
+      { name: 'లక్ష్మి', kind: 'farmer', village: 'ఊరు-ఎ', days: 20 },
+      { name: 'వెంకట్', kind: 'farmer', village: 'ఊరు-బి', days: 20 },
+    ];
+    for (const c of farmers) ids['f|' + c.name] = await ensureCustomer(rythuId, c);
+    for (const c of farmers) {
+      if (c.days > 30) await stampCustomer(ids['f|' + c.name], c.days);
+    }
     const ry = async (key, body, days) => {
-      const posted = await post(shopId, Object.assign({ idempotency_key: key, source: 'screen' }, body));
-      await stampTx(shopId, key, days);
+      const posted = await post(rythuId, Object.assign({ idempotency_key: key, source: 'screen' }, body));
+      await stampTx(rythuId, key, days);
       return posted;
     };
     const suresh = ids['f|సురేష్'];
@@ -198,6 +210,6 @@ async function stampCustomer(id, days) {
       event: 'payment', settlement_id: c.id,
     }, 4);
 
-    console.log('seed ok phone=' + PHONE + ' PIN=' + PIN);
+    console.log('seed ok shops=' + SHOPS.map(s => s.phone).join(',') + ' PIN=' + PIN);
   } catch (e) { fail(e); }
 })();

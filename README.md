@@ -48,6 +48,28 @@ Required env vars (missing/placeholder values are fatal at startup in production
 - Env: `NODE_ENV=production`, `TRUST_PROXY=1`, `APP_ORIGIN=https://<your-domain>`, plus the vars above.
 - Persistent disk for `data/tts-cache` (optional — it regenerates; the server starts fine if it is missing).
 
+## Keep-alive (free-tier cron)
+
+Render's free tier sleeps the service; first requests then stall for tens of seconds.
+A 5-minute cron keeps it awake (and keeps the Supabase pool warm):
+
+1. Generate a secret once: `node -e "console.log(require('crypto').randomBytes(24).toString('base64url'))"`
+2. Set it on Render: env var `KEEPALIVE_TOKEN=<that secret>` (never commit it).
+3. Create a cron job on <https://cron-job.org> (free): URL
+
+   ```
+   https://<your-render-domain>/keepalive?k=<KEEPALIVE_TOKEN>
+   ```
+
+   interval: **every 5 minutes**. The endpoint answers `{ok:true}` for the right
+   token; anything else reads as a generic 404. The `k` value is never echoed or
+   logged. `/healthz` stays public and secret-free (Render's own health check
+   should keep using `/healthz`).
+
+Cold starts surviving anyway: the browser shows a non-blocking
+"సర్వర్ మేల్కొంటోంది…" banner after 4 s, retries failing GETs once,
+and gives up after 30 s with a clear Telugu message.
+
 ## Architecture (10 lines)
 
 1. Express server (`server.js`) — CSP-safe static frontend + JSON API, signed httpOnly session cookies.
@@ -71,6 +93,6 @@ Required env vars (missing/placeholder values are fatal at startup in production
 ## Tests
 
 ```bash
-npm test          # 52 hermetic checks (no network, no credits spent)
+npm test          # 190+ hermetic checks (no network, no credits spent)
 npm run smoke     # 40 end-to-end checks against the real Supabase
 ```
