@@ -89,6 +89,7 @@ function ledgerFail(res, e, ctx) {
     NOT_DISPUTED: 409,
     NOT_FOUND: 404, NOT_OWNED: 404,
     NOT_REVERSIBLE: 400, BAD_REQUEST: 400, ACK_BAD_STATE: 400, ACK_NOT_ALLOWED: 400,
+    REASON_REQUIRED: 400, DISCOUNT_TOO_BIG: 400,
     NO_LEDGER: 500,
   }[(e && e.code)] || 0;
   const final = status || 500; // unmapped -> 500 (and it must still be logged)
@@ -429,7 +430,7 @@ app.post('/api/auth/challenge/answer', answerLimiter, (req, res) => {
   res.json({ voiceOkToken });
 });
 
-const SHOP_COLS = 'id, phone, owner_name, shop_name, address, voice_id, business_type, created_at';
+const SHOP_COLS = 'id, phone, owner_name, shop_name, address, voice_id, business_type, commission_percent, created_at';
 const profileCompleteOf = s => !!(s && s.owner_name && s.shop_name && s.address);
 
 app.post('/api/auth/signup', signupLimiter, async (req, res) => {
@@ -686,9 +687,22 @@ app.put('/api/me', async (req, res) => {
   if (owner.length > 80 || shopName.length > 120 || address.length > 500) {
     return res.status(400).json({ error: 'వివరాలు చాలా పొడవుగా ఉన్నాయి (పేరు 80, దుకాణం 120, చిరునామా 500 అక్షరాలు)' });
   }
+  // optional aadhati commission suggestion % (0–100); absent = leave as-is
+  const upd = { owner_name: owner, shop_name: shopName, address };
+  if (b.commission_percent !== undefined) {
+    if (b.commission_percent === null || b.commission_percent === '') {
+      upd.commission_percent = null;
+    } else {
+      const pct = Number(b.commission_percent);
+      if (!Number.isFinite(pct) || pct < 0 || pct > 100) {
+        return res.status(400).json({ error: 'కమీషన్ 0-100% మధ్య ఉండాలి' });
+      }
+      upd.commission_percent = pct;
+    }
+  }
   try {
     const { data, error } = await db().from('shops')
-      .update({ owner_name: owner, shop_name: shopName, address })
+      .update(upd)
       .eq('id', req.shop.id).select(SHOP_COLS).single();
     if (error) throw error;
     res.json({ shop: data, profileComplete: true });
@@ -810,7 +824,7 @@ app.post('/api/tts', ttsApiLimiter, contentLength(8 * 1024), async (req, res) =>
 app.get('/api/customers', requireBizType, async (req, res) => {
   try {
     const [c, t] = await Promise.all([
-      db().from('customers').select('id, name, label, phone, aliases, kind, village, created_at')
+      db().from('customers').select('id, name, label, phone, aliases, kind, village, credit_limit, promise_date, created_at')
         .eq('shop_id', req.shop.id).order('name', { ascending: true }),
       db().from('transactions').select('customer_id, type, amount, created_at, status, ack_status')
         .eq('shop_id', req.shop.id),
@@ -851,13 +865,50 @@ app.post('/api/customers', requireBizType, async (req, res) => {
   if (name.length > 100) return res.status(400).json({ error: 'పేరు చాలా పొడవుగా ఉంది' });
   if (label && label.length > 60) return res.status(400).json({ error: 'లేబుల్ చాలా పొడవుగా ఉంది' });
   if (phone && !/^[+0-9]{7,15}$/.test(phone)) return res.status(400).json({ error: 'ఫోన్ నంబర్ సరిలేదు' });
+  // optional opening balance from the paper notebook (a VALIDATED amount; the
+  // ledger row is posted AFTER the account exists and is reversible like any row)
+  let openingPaise = null;
+  if (b.opening_balance != null && String(b.opening_balance).trim() !== '') {
+    try {
+      openingPaise = money.toPaise(b.opening_balance);
+    } catch (e) {
+      if (e && e.name === 'MoneyError') return res.status(400).json({ error: 'ఓపెనింగ్ బ్యాలెన్స్ సరికాదు' });
+      throw e;
+    }
+    if (!(openingPaise > 0)) return res.status(400).json({ error: 'ఓపెనింగ్ బ్యాలెన్స్ సరికాదు' });
+  }
   try {
     const { data, error } = await db().from('customers').insert({
       shop_id: req.shop.id, name, label, phone, kind, village,
       aliases: [], created_at: new Date().toISOString(),
     }).select('id, name, label, phone, aliases, kind, village, created_at').single();
     if (error) throw error;
-    res.status(201).json({ ...data, balance: 0, last_activity: null });
+    let openingPosted = false;
+    if (openingPaise != null) {
+      // kirana: they owed you at book-start (credit / receivable). rythu: you
+      // had already paid them (pay / payable — an advance to recover).
+      const opening = {
+        customer_id: data.id,
+        type: kind === 'farmer' ? 'pay' : 'credit',
+        amount: money.paiseToRupees(openingPaise),
+        workflow: bt.workflowOf(req.shop.business_type),
+        direction: kind === 'farmer' ? 'payable' : 'receivable',
+        event: 'opening_balance',
+        note: 'పాత బాకీ / ఓపెనింగ్ · Opening balance',
+        payment_mode: 'cash',
+        source: 'screen',
+        idempotency_key: 'opening:' + data.id + ':' + Date.now(),
+      };
+      try {
+        const posted = await ledger.postTransactions(req.shop.id, [opening]);
+        openingPosted = !!(posted && posted.length && !posted[0].dedup);
+      } catch (le) {
+        // the account exists; never 500 the create because the opening row
+        // glitched — surface it so the UI can prompt a retry
+        console.error('opening-balance post failed', le.code || 'DB');
+      }
+    }
+    res.status(201).json({ ...data, balance: 0, last_activity: null, opening_posted: openingPosted });
   } catch (e) { fail(res, e, 'customers/post'); }
 });
 
@@ -874,7 +925,8 @@ app.post('/api/transactions', requireBizType, async (req, res) => {
       // rythu buys produce: the farmer account is always direction='payable'
       direction: b.direction === 'payable' ? 'payable'
         : b.workflow === 'rythu' ? 'payable' : 'receivable',
-      event: b.event, note: b.note, produce: b.produce,
+      event: b.event, note: b.note, reason: b.reason, payment_mode: b.payment_mode,
+      produce: b.produce,
       deduction_category: b.deduction_category,
       quantity: b.quantity, rate: b.rate, unit: b.unit, rate_unit: b.rate_unit,
       bag_kg: b.bag_kg,                       // rythu only: bag weight for the amount math
@@ -1101,7 +1153,7 @@ app.post('/api/voice/propose', requireBizType, async (req, res) => {
 });
 
 // ---- customer helpers: every id from the client is re-checked against THIS shop ----
-const CUST_COLS = 'id, name, label, phone, aliases, kind, village, created_at';
+const CUST_COLS = 'id, name, label, phone, aliases, kind, village, credit_limit, promise_date, created_at';
 async function ownCustomer(req, id) {
   const { data, error } = await db().from('customers').select(CUST_COLS)
     .eq('id', String(id == null ? '' : id)).eq('shop_id', req.shop.id).limit(1);
@@ -1152,6 +1204,23 @@ app.patch('/api/customers/:id', requireBizType, async (req, res) => {
       if (v.length > 60) return res.status(400).json({ error: 'గ్రామం పేరు చాలా పొడవుగా ఉంది' });
       upd.village = v || null;
     }
+    // kirana credit discipline: credit_limit (amount, null clears it)
+    if (b.credit_limit !== undefined) {
+      if (b.credit_limit === null || b.credit_limit === '') upd.credit_limit = null;
+      else {
+        let p; try { p = money.toPaise(b.credit_limit); } catch (e) { p = null; }
+        if (p == null || !(p >= 0)) return res.status(400).json({ error: 'క్రెడిట్ లిమిట్ సరికాదు' });
+        upd.credit_limit = money.paiseToRupees(p);
+      }
+    }
+    // promise date (YYYY-MM-DD, null clears it); other business types may set
+    // nothing here — they simply never send the field
+    if (b.promise_date !== undefined) {
+      if (b.promise_date === null || b.promise_date === '') upd.promise_date = null;
+      else if (!/^\d{4}-\d{2}-\d{2}$/.test(String(b.promise_date))) {
+        return res.status(400).json({ error: 'తేదీ సరిలేదు (YYYY-MM-DD)' });
+      } else upd.promise_date = String(b.promise_date);
+    }
     if (!Object.keys(upd).length) return res.status(400).json({ error: 'మార్పు ఏమీ లేదు' });
     const { data, error } = await db().from('customers').update(upd)
       .eq('id', cur.id).eq('shop_id', req.shop.id).select(CUST_COLS).single();
@@ -1196,7 +1265,7 @@ app.get('/api/customers/:id/transactions', requireBizType, async (req, res) => {
     const c = await ownCustomer(req, req.params.id);
     if (!c) return res.status(404).json({ error: 'కస్టమర్ దొరకలేదు' });
     const { data, error } = await db().from('transactions')
-      .select('id, customer_id, type, amount, raw_transcript, created_at, event, workflow, direction, status, reverses_id, reason, ack_status')
+      .select('id, customer_id, type, amount, raw_transcript, created_at, event, workflow, direction, status, reverses_id, reason, payment_mode, ack_status')
       .eq('shop_id', req.shop.id).eq('customer_id', c.id)
       .order('created_at', { ascending: false });
     if (error) throw error;
@@ -1259,7 +1328,11 @@ app.get('/api/transactions', requireBizType, async (req, res) => {
     if (t.error) throw t.error;
     if (c.error) throw c.error;
     const names = new Map((c.data || []).map(x => [x.id, x.name]));
-    const transactions = (t.data || []).map(x => ({ ...x, customer_name: names.get(x.customer_id) || null }));
+    // opening_balance is book-start history, not a today entry — it lives in
+    // the statement, never in the day's entry list/counts
+    const transactions = (t.data || [])
+      .filter(x => x.event !== 'opening_balance')
+      .map(x => ({ ...x, customer_name: names.get(x.customer_id) || null }));
     res.json({ date, transactions });
   } catch (e) { fail(res, e, 'transactions/get'); }
 });
@@ -1298,6 +1371,39 @@ app.post('/api/transactions/:id/allocate', rythuOnly, async (req, res) => {
   try {
     res.json(await ledger.allocateToSettlement(req.shop.id, String(req.params.id), String(settlementId)));
   } catch (e) { ledgerFail(res, e, 'transactions/allocate'); }
+});
+
+// ---------------- STATEMENTS + EXPORT (Task 2) ----------------
+const QUERY_DATE = v => (typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v) ? v : undefined);
+
+// GET /api/statements/customer/:id?from&to — ONE customer's date-windowed
+// statement with running balance (kirana statement, rythu farmer ledger too)
+app.get('/api/statements/customer/:id', requireBizType, async (req, res) => {
+  try {
+    res.json(await ledger.statementWindow(
+      req.shop.id, String(req.params.id),
+      QUERY_DATE(req.query.from), QUERY_DATE(req.query.to),
+    ));
+  } catch (e) { ledgerFail(res, e, 'statements/customer'); }
+});
+
+// GET /api/statements/settlement/:id — the aadhati పట్టీ (one settlement slip)
+app.get('/api/statements/settlement/:id', rythuOnly, async (req, res) => {
+  try {
+    res.json(await ledger.settlementSlip(req.shop.id, String(req.params.id)));
+  } catch (e) { ledgerFail(res, e, 'statements/settlement'); }
+});
+
+// GET /api/export/transactions.csv?from&to — shop-scoped CSV (Excel-safe BOM)
+app.get('/api/export/transactions.csv', requireBizType, async (req, res) => {
+  try {
+    const out = await ledger.transactionsExport(
+      req.shop.id, QUERY_DATE(req.query.from), QUERY_DATE(req.query.to),
+    );
+    res.set('Content-Type', 'text/csv; charset=utf-8');
+    res.set('Content-Disposition', `attachment; filename="khata-vani-transactions-${istToday()}.csv"`);
+    res.send(out.csv);
+  } catch (e) { ledgerFail(res, e, 'export/transactions'); }
 });
 
 // ---------------------------------------------------------------------------

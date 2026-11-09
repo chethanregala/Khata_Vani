@@ -81,6 +81,7 @@ function stepFail(name, status) {
   let realShopId = null;
   let realShop2Id = null;
   let realShop3Id = null;
+  let cookieA = null; // shop A's session, saved for the Task 2 commission block
   try {
     // ---- 1. signup through the real auth flow ----
     // valid: starts with 9, ten digits; the number itself is NEVER printed
@@ -91,6 +92,7 @@ function stepFail(name, status) {
     if (!up.res.ok) throw up.out;
     realShopId = up.data && up.data.shop && up.data.shop.id;
     if (!realShopId) throw up.out;
+    cookieA = cookie;
     ok('signup created a session (cookie set)', !!cookie && !!up.data.shop);
 
     // ---- 1b. profile + the one-time business-type choice (rythu) ----
@@ -427,6 +429,123 @@ function stepFail(name, status) {
     const isoAck = await reqJSON('cross-shop-ack', 'POST', '/api/transactions/' + entryId + '/ack-link', {});
     ok('cross-shop ack-link rejected', !isoAck.res.ok && isoAck.res.status === 404, isoAck.res.status);
     cookie = cookieB; // back to shop B's session for any later steps
+
+    // ---- 18b. TASK 2: accounting essentials (kirana shop B + rythu shop A) ----
+    // opening balance → credit → UPI payment → discount, statement, CSV export
+    const oname = '__SMOKE acct ' + crypto.randomUUID().slice(0, 8);
+    const oc = await reqJSON('acct-cust', 'POST', '/api/customers',
+      { name: oname, kind: 'customer', opening_balance: 1000 });
+    ok('create with opening balance 1000 posts the opening row server-side',
+      oc.res.ok && oc.data && oc.data.opening_posted === true, JSON.stringify(oc.out).slice(0, 60));
+    const oid = oc.data && oc.data.id;
+    const otl = await fetch(BASE + '/api/customers/' + oid + '/transactions', { headers: { Cookie: cookie } });
+    const otlRows = otl.ok ? ((await otl.json()).transactions || []) : [];
+    ok('timeline shows one opening_balance row', otlRows.filter(t => t.event === 'opening_balance').length === 1);
+    const st0 = await reqJSON('stmt-open', 'GET', '/api/statements/customer/' + oid);
+    ok('statement: opening row, closing ₹1000', st0.res.ok && st0.data &&
+      st0.data.closing === 1000 && (st0.data.transactions || []).length === 1 &&
+      st0.data.transactions[0].event === 'opening_balance');
+    const clmt = await reqJSON('acct-patch-limit', 'PATCH', '/api/customers/' + oid,
+      { credit_limit: 2000, promise_date: '2026-11-15' });
+    ok('credit_limit / promise_date editable', clmt.res.ok);
+    const cr2 = await reqJSON('acct-credit-500', 'POST', '/api/transactions', {
+      customer_id: oid, workflow: 'kirana', type: 'credit', event: 'goods_credit', amount: 500,
+      idempotency_key: crypto.randomUUID(), source: 'screen',
+    });
+    if (!cr2.res.ok) throw cr2.out;
+    const pay2 = await reqJSON('acct-pay-300-upi', 'POST', '/api/transactions', {
+      customer_id: oid, workflow: 'kirana', type: 'pay', event: 'repayment', amount: 300,
+      payment_mode: 'upi', idempotency_key: crypto.randomUUID(), source: 'screen',
+    });
+    if (!pay2.res.ok) throw pay2.out;
+    const st1 = await reqJSON('stmt-1200', 'GET', '/api/statements/customer/' + oid);
+    ok('statement running: 1000 → 1500 → ₹1200 by UPI',
+      st1.res.ok && st1.data.closing === 1200 &&
+      st1.data.transactions.some(t => t.type === 'pay' && t.payment_mode === 'upi'),
+      st1.res.ok ? '' : st1.res.status);
+    const disc = await reqJSON('acct-discount-ok', 'POST', '/api/transactions', {
+      customer_id: oid, workflow: 'kirana', type: 'pay', event: 'discount', amount: 40,
+      reason: 'smoke write-off', idempotency_key: crypto.randomUUID(), source: 'screen',
+    });
+    ok('small write-off ₹40 posts (₹50 cap: 40 ≤ max(5% of 1200, 50))', disc.res.ok,
+      disc.res.status);
+    const discNoReason = await reqJSON('acct-discount-noreason', 'POST', '/api/transactions', {
+      customer_id: oid, workflow: 'kirana', type: 'pay', event: 'discount', amount: 40,
+      idempotency_key: crypto.randomUUID(), source: 'screen',
+    });
+    ok('write-off needs a reason (REASON_REQUIRED)',
+      !discNoReason.res.ok && discNoReason.res.status === 400 && discNoReason.out.code === 'REASON_REQUIRED',
+      discNoReason.res.status + '/' + discNoReason.out.code);
+    const discBig = await reqJSON('acct-discount-big', 'POST', '/api/transactions', {
+      customer_id: oid, workflow: 'kirana', type: 'pay', event: 'discount', amount: 65,
+      reason: 'smoke too big', idempotency_key: crypto.randomUUID(), source: 'screen',
+    });
+    ok('write-off over the cap refused (DISCOUNT_TOO_BIG)',
+      !discBig.res.ok && discBig.res.status === 400 && discBig.out.code === 'DISCOUNT_TOO_BIG',
+      discBig.res.status + '/' + discBig.out.code);
+    const st2 = await reqJSON('stmt-closing-1160', 'GET', '/api/statements/customer/' + oid);
+    ok('statement closing after write-off = ₹1160 with a discount row',
+      st2.res.ok && st2.data.closing === 1160 &&
+      st2.data.transactions.some(t => t.event === 'discount'));
+    const todayK = new Date(Date.now() + 330 * 60000).toISOString().slice(0, 10);
+    const dayList = await fetch(BASE + '/api/transactions?date=' + todayK, { headers: { Cookie: cookie } });
+    const dayRows = dayList.ok ? ((await dayList.json()).transactions || []) : [];
+    ok("opening_balance never shows in today's entry list", dayRows.every(t => t.event !== 'opening_balance'));
+    const csvRes = await fetch(BASE + '/api/export/transactions.csv', { headers: { Cookie: cookie } });
+    const csvBytes = csvRes.ok ? new Uint8Array(await csvRes.arrayBuffer()) : new Uint8Array(0);
+    // response.text() would STRIP the BOM (UTF-8 TextDecoder default) — check bytes
+    const bom = csvBytes.length > 3 && csvBytes[0] === 0xEF && csvBytes[1] === 0xBB && csvBytes[2] === 0xBF;
+    const csvText = Buffer.from(csvBytes.subarray(3)).toString('utf8');
+    ok('CSV export: BOM + shop rows (names, mode, quoted header)',
+      csvRes.ok && bom && csvText.indexOf(oname) !== -1 && csvText.indexOf('upi') !== -1, csvRes.status);
+    // ---- 18c. rythu commission suggestion (shop A) + slip + farmer statement ----
+    cookie = cookieA;
+    const meA = await reqJSON('acct-me-a', 'GET', '/api/me');
+    if (!meA.res.ok) throw meA.out;
+    const commPut = await reqJSON('acct-comm-put', 'PUT', '/api/me', {
+      owner_name: (meA.data.shop && meA.data.shop.owner_name) || 'o',
+      shop_name: (meA.data.shop && meA.data.shop.shop_name) || 's',
+      address: (meA.data.shop && meA.data.shop.address) || 'a',
+      commission_percent: 2,
+    });
+    ok('settings accept commission_percent 0-100',
+      commPut.res.ok && commPut.data.shop && commPut.data.shop.commission_percent === 2);
+    const commBad = await reqJSON('acct-comm-bad', 'PUT', '/api/me', {
+      owner_name: 'o', shop_name: 's', address: 'a', commission_percent: 250,
+    });
+    ok('commission_percent 250 refused (400)',
+      !commBad.res.ok && commBad.res.status === 400);
+    // the confirm-card path: post a commission deduction on the smoke delivery
+    const comm = await reqJSON('acct-commission', 'POST', '/api/transactions', {
+      customer_id: farmerId, workflow: 'rythu', type: 'pay', event: 'deduction',
+      deduction_category: 'commission', amount: 220, settlement_id: d.id,
+      payment_mode: 'cash',
+      idempotency_key: 'comm:' + d.id, // the suggestion card's deterministic key
+      source: 'screen',
+    });
+    ok('commission suggestion posts as a deduction on the settlement (2% of ₹11,000 = ₹220)',
+      comm.res.ok && comm.data && comm.data.idempotency_key === 'comm:' + d.id, comm.res.status);
+    const commAgain = await reqJSON('acct-commission-retry', 'POST', '/api/transactions', {
+      customer_id: farmerId, workflow: 'rythu', type: 'pay', event: 'deduction',
+      deduction_category: 'commission', amount: 220, settlement_id: d.id,
+      idempotency_key: 'comm:' + d.id, source: 'screen',
+    });
+    ok('commission key is idempotent (one suggestion → at most one row)',
+      commAgain.res.ok && commAgain.data && commAgain.data.id === comm.data.id);
+    const slip = await reqJSON('acct-slip', 'GET', '/api/statements/settlement/' + d.id);
+    ok('slip: gross − itemised = remaining, commission itemised',
+      slip.res.ok && slip.data && slip.data.settlement.gross === 11000 &&
+      (slip.data.deductions || []).some(x => x.deduction_category === 'commission') &&
+      slip.data.remaining === slip.data.settlement.gross -
+        ((slip.data.advance_total || 0) + (slip.data.deduction_total || 0) + (slip.data.payment_total || 0)),
+      slip.res.ok ? '' : slip.res.status);
+    const fstmt = await reqJSON('acct-farmer-stmt', 'GET', '/api/statements/customer/' + farmerId);
+    ok('farmer statement carries the farmer header + rows',
+      fstmt.res.ok && fstmt.data && fstmt.data.customer.name === fname &&
+      (fstmt.data.transactions || []).length > 0 && fstmt.data.customer.kind === 'farmer');
+    const slipNoAuth = await fetch(BASE + '/api/statements/settlement/' + d.id, { headers: { Cookie: cookieB } });
+    ok('kirana shop cannot read a rythu slip (403)', slipNoAuth.status === 403, slipNoAuth.status);
+    cookie = cookieB; // back to shop B for the cross-shop isolation steps below
 
     console.log('\n[smoke] EVERY STEP PASSED — rythu save works against the real server');
   } catch (e) {

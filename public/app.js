@@ -78,6 +78,12 @@ function logoSVG() {
 function route() {
   const view = (location.hash || '#/splash').split('?')[0];
   if (view.startsWith('#/rythu/farmer/')) return viewRythuFarmer(decodeURIComponent(view.slice('#/rythu/farmer/'.length)));
+  if (view.startsWith('#/print/customer/')) {
+    const i = view.indexOf('?');
+    return viewPrintCustomer(decodeURIComponent(view.slice('#/print/customer/'.length, i === -1 ? undefined : i)),
+      i === -1 ? {} : Object.fromEntries(new URLSearchParams(location.hash.split('?')[1] || '')));
+  }
+  if (view.startsWith('#/print/slip/')) return viewPrintSlip(decodeURIComponent(view.slice('#/print/slip/'.length)));
   if (view.startsWith('#/customer/')) return viewCustomer(decodeURIComponent(view.slice('#/customer/'.length)));
   if (view === '#/customers' || view === '#/farmers') {
     // one list per business type; walking into the other's list just shows yours
@@ -545,6 +551,22 @@ async function viewSettings() {
     <div id="sterr" class="err" hidden></div>
     <button id="stSave" class="btn primary">సేవ్ చేయండి · Save</button>
     <p class="saved" id="stSaved" hidden>✅ సేవ్ అయింది · saved</p>
+    ${state.mode === 'rythu' ? `
+    <h2 class="section">కమీషన్ · Commission</h2>
+    <label class="field" for="stComm">సూచింపు శాతం (0-100, ఐచ్ఛికం) · Suggested % (optional)</label>
+    <input id="stComm" class="input" inputmode="decimal" value="${esc(s.commission_percent != null ? s.commission_percent : '')}" placeholder="2">
+    <p class="q-sub">సరుకు నమోదైన తర్వాత "కమీషన్ నమోదు చేయాలా?" కార్డులో ఇదే డీఫాల్ట్ · used as the default in the commission suggestion card</p>` : ''}
+    <h2 class="section">ఎగుమతి · Export (CSV)</h2>
+    <div class="card">
+      <p class="q-sub">ఈ దుకాణపు నమోదులు Excel కోసం (Telugu సరిగ్గా ఉండేలా) · This shop's entries for Excel (UTF-8 BOM)</p>
+      <div class="export-dates">
+        <label class="field" for="exFrom">నుండి · From</label>
+        <input id="exFrom" class="input" type="date">
+        <label class="field" for="exTo">వరకు · To</label>
+        <input id="exTo" class="input" type="date">
+      </div>
+      <a id="exBtn" class="btn wide" href="/api/export/transactions.csv" download>⬇ CSV డౌన్‌లోడ్ · Download</a>
+    </div>
     <h2 class="section">వ్యాపార రకం · Business type</h2>
     <div class="card" id="stBiz">${state.mode === 'rythu'
       ? 'రైతు వ్యాపారి · Farmer-trader (aadhati)'
@@ -555,6 +577,16 @@ async function viewSettings() {
   </main>
   ${tabbar('#/settings')}`;
   wireTopbar();
+  // CSV export link carries the optional date range
+  const exBtn = $('#exBtn');
+  if (exBtn) exBtn.onclick = () => {
+    const f = $('#exFrom').value, t = $('#exTo').value;
+    const q = [];
+    if (f) q.push('from=' + encodeURIComponent(f));
+    if (t) q.push('to=' + encodeURIComponent(t));
+    exBtn.href = '/api/export/transactions.csv' + (q.length ? '?' + q.join('&') : '');
+  }; // click then downloads with the fresh href
+  const commIn = $('#stComm');
   $('#stLogout').onclick = async () => { try { await api('/api/auth/logout', { method: 'POST' }); } catch (_) {} goLogin(); };
   $('#stSave').onclick = async () => {
     const err = $('#sterr');
@@ -567,9 +599,18 @@ async function viewSettings() {
     if (owner_name.length > 80 || shop_name.length > 120 || address.length > 500) {
       return showErr(err, 'వివరాలు చాలా పొడవుగా ఉన్నాయి');
     }
+    const body = { owner_name, shop_name, address };
+    if (commIn) {
+      if (commIn.value.trim() === '') body.commission_percent = null;
+      else {
+        const pct = Number(commIn.value);
+        if (!Number.isFinite(pct) || pct < 0 || pct > 100) return showErr(err, 'కమీషన్ 0-100% మధ్య ఉండాలి');
+        body.commission_percent = pct;
+      }
+    }
     $('#stSave').disabled = true;
     try {
-      const r = await api('/api/me', { method: 'PUT', body: { owner_name, shop_name, address } });
+      const r = await api('/api/me', { method: 'PUT', body });
       applyShop(r.shop);
       $('#stSaved').hidden = false;
       $('#stLogout').focus();
@@ -668,12 +709,84 @@ function timeOf(iso) {
   try { return new Date(iso).toLocaleString('en-IN', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }); }
   catch (_) { return ''; }
 }
-// overdue: balance > 0 and no payment in the last 30 days (never paid -> since creation)
+// overdue: balance > 0 AND (promise date passed) OR (else no payment in the
+// last 30 days; never paid -> since creation)
 function isOverdue(c) {
   if (!(c.balance > 0)) return false;
+  if (c.promise_date) return new Date(c.promise_date) < new Date(istToday());
   const ref = c.last_payment_at || c.created_at;
   if (!ref) return false;
   return (Date.now() - new Date(ref).getTime()) > 30 * 86400000;
+}
+
+// ================= Task 2 accounting helpers =================
+const PAY_MODES_UI = [['నగదు Cash', 'cash'], ['UPI', 'upi'], ['బ్యాంక్ Bank', 'bank'], ['ఇతర Other', 'other']];
+// payment-mode chip row (CSP-safe: no inline handlers; caller binds behaviour)
+function payModeChips(wrapId, selected) {
+  return `<div class="chips-wrap pay-chips" id="${esc(wrapId)}">${PAY_MODES_UI.map(([te, en]) =>
+    `<button class="chip-btn${(selected || 'cash') === en ? ' on' : ''}" data-mode="${en}" type="button">${te}</button>`).join('')}</div>`;
+}
+function wirePayChips(wrapSel, entry) {
+  const wrap = $(wrapSel);
+  if (!wrap) return;
+  wrap.addEventListener('click', ev => {
+    const b = ev.target.closest('[data-mode]');
+    if (!b) return;
+    entry.payment_mode = b.dataset.mode;
+    wrap.querySelectorAll('.chip-btn').forEach(x => x.classList.toggle('on', x === b));
+  });
+}
+// small-leftover write-off cap: max(5% of the amount owed before, ₹50)
+function writeOffMax(before) {
+  if (!(before > 0)) return 0;
+  return Math.max(Math.ceil(before * 0.05), 50);
+}
+// after a payment that leaves a small remainder, offer to write it off —
+// NEVER silently: a reason is required and the ledger caps the size
+function offerWriteOff(customerId, direction, beforePaise, afterPaise) {
+  const rem = Math.round(Number(afterPaise) || 0);
+  if (!(rem > 0) || rem > writeOffMax(beforePaise)) return;
+  const el = $('#panel');
+  if (!el) return;
+  const c = (state.customers || []).find(x => x.id === customerId)
+    || (state.rythuFarmers || []).find(x => x.id === customerId) || { name: '' };
+  el.innerHTML = `
+  <div class="card">
+    <div class="q-title">మిగిలింది వదులుకోండి? · Write off remainder?</div>
+    <p class="q-sub">చెల్లింపు తర్వాత కేవలం ${esc(fmtINR(rem))} మిగిలింది. రాయితీగా నమోదు చేయాలా? · Only ₹${esc(fmtINR(rem))} left — record it as a discount?</p>
+    <label class="field" for="woReason">కారణం (తప్పనిసరి) · Reason (required)</label>
+    <input id="woReason" class="input" maxlength="200" placeholder="చిన్న మొత్తం · small amount">
+    <div id="woErr" class="err" hidden></div>
+    <div class="confirm-actions">
+      <button id="woYes" class="btn primary" type="button">✅ రాయితీ · Write off</button>
+      <button id="woNo" class="btn ghost" type="button">❌ వదులుకోండి · Keep</button>
+    </div>
+  </div>`;
+  speak(`${c.name || ''}. కేవలం ${rem} రూపాయలు మిగిలింది. వదులుకోవాలా?`);
+  $('#woNo').onclick = clearFlow;
+  $('#woYes').onclick = async () => {
+    const reason = ($('#woReason') ? $('#woReason').value : '').trim();
+    if (!reason) return showErr($('#woErr'), 'రాయితీకి కారణం తప్పనిసరి · reason required');
+    const b = $('#woYes'); b.disabled = true;
+    try {
+      await api('/api/transactions', {
+        method: 'POST',
+        body: {
+          customer_id: customerId, type: 'pay', event: 'discount', amount: rem,
+          direction, reason, payment_mode: 'cash',
+          raw_transcript: 'discount write-off (screen)', idempotency_key: newKey(), source: 'screen',
+        },
+      });
+      speak('రాయితీ నమోదు అయింది. · written off');
+      clearFlow();
+      await refreshHome().catch(() => {});
+      await refreshRythu().catch(() => {});
+    } catch (e) {
+      if (e.status === 401) return goLogin();
+      showErr($('#woErr'), e.message);
+      b.disabled = false;
+    }
+  };
 }
 
 // ---------- audio helpers (PCM16 wav -> 16 kHz mono for STT) ----------
@@ -1030,6 +1143,10 @@ function renderConfirmCard() {
   const balBefore = v && v.balanceBefore != null ? Number(v.balanceBefore)
     : (c && typeof c.balance === 'number' ? c.balance : null);
   const balAfter = balBefore == null ? null : balBefore + (e.type === 'credit' ? Number(e.amount) : -Number(e.amount));
+  // non-blocking credit-limit warning (balance-after over the customer's cap)
+  const limitWarn = c && c.credit_limit != null && e.type === 'credit' &&
+    balAfter != null && Number(balAfter) > Number(c.credit_limit)
+    ? `<div class="warn-note">⚠ క్రెడిట్ లిమిట్ ${esc(fmtINR(c.credit_limit))} మించింది — మీరు నిర్ణయించుకోండి · exceeds their credit limit (advisory)</div>` : '';
   const warnings = (v && v.candidate && v.candidate[0] && v.candidate[0].warnings) || [];
   const missing = missingLines(v && v.missingFields, e);
   p.ready = !!v && !missing.length;
@@ -1045,10 +1162,13 @@ function renderConfirmCard() {
       <label class="field" for="cfAmt">మొత్తం · Amount</label>
       <input id="cfAmt" class="input" type="number" inputmode="numeric" min="1" value="${esc(Number(e.amount) || '')}">
       <button id="cfType" class="chip-btn" type="button" aria-label="రకం మార్చండి">రకం · ${typeTe(e.type)} (tap to switch)</button>
+      <span class="field-label">చెల్లింపు ఎలా? · Payment mode</span>
+      ${payModeChips('cfPayMode', e.payment_mode)}
     </div>
     <div class="bal-flip">బ్యాలెన్స్‌లోడవుతోంది…</div>
     ${warnings.indexOf('OVERPAYMENT') !== -1 ? `
       <div class="warn-note">జమ మిగిలిన బాకీ కంటే ఎక్కువ అవుతోంది — సేవ్ అయితె తిరస్కరించబడుతుంది · repayment exceeds balance; the save would be rejected</div>` : ''}
+    ${limitWarn || ''}
     ${missing.length ? `<div class="missing-note">అవసరం · needed: ${esc(missing.map(m => MISSING_LABELS[m] || m).join(', '))}</div>` : ''}
     <label class="field" for="cfTx">నేను విన్నది · I heard (editable)</label>
     <input id="cfTx" class="input" value="${esc(e.raw || '')}">
@@ -1064,6 +1184,7 @@ function renderConfirmCard() {
   $('#no').onclick = onNo;
   $('#other').onclick = () => askNewCustomer(e);
   $('#cfType').onclick = () => { e.type = e.type === 'credit' ? 'pay' : 'credit'; renderConfirmCard(); };
+  wirePayChips('#cfPayMode', e);
   const amtIn = $('#cfAmt'), txIn = $('#cfTx'), flip = $('.bal-flip', el);
   amtIn.addEventListener('input', () => {
     const a = Math.round(Number(amtIn.value));
@@ -1136,6 +1257,8 @@ function askNewCustomer(entry) {
     <input id="ncLabel" class="input" maxlength="60" placeholder="tailor, driver…">
     <label class="field" for="ncPhone">ఫోన్ (ఐచ్ఛికం) · Phone (optional)</label>
     <input id="ncPhone" class="input" type="tel" inputmode="numeric" maxlength="10" placeholder="98765 43210">
+    <label class="field" for="ncOpen">పాత బాకీ / ఓపెనింగ్ (ఐచ్ఛికం) · Opening balance from your notebook (optional)</label>
+    <input id="ncOpen" class="input" inputmode="numeric" placeholder="0">
     <div id="ncErr" class="err" hidden></div>
     <div class="confirm-actions">
       <button id="yes" class="btn primary" type="button">✅ చేర్చండి</button>
@@ -1198,8 +1321,21 @@ async function onYes() {
       let c = state.customers.find(x => resolve.normalize(x.name) === n ||
         (x.aliases || []).some(a => resolve.normalize(a) === n)) || null;
       if (!c) {
-        c = await api('/api/customers', { method: 'POST', body: { name, label, phone: phoneRaw || null } });
-        state.customers.push({ ...c, balance: 0, last_activity: null, last_payment_at: null });
+        // opening balance is posted SERVER-SIDE exactly once, with this account
+        const openRaw = ($('#ncOpen') && $('#ncOpen').value.trim()) || '';
+        const rvOpen = openRaw ? Number(openRaw) : null;
+        if (openRaw && !(rvOpen > 0)) {
+          btns.forEach(b => { b.disabled = false; });
+          return showErr($('#ncErr'), 'ఓపెనింగ్ బ్యాలెన్స్ సరికాదు · invalid opening balance');
+        }
+        c = await api('/api/customers', {
+          method: 'POST',
+          body: { name, label, phone: phoneRaw || null, opening_balance: openRaw || undefined },
+        });
+        state.customers.push({
+          ...c, balance: rvOpen > 0 ? rvOpen : 0, last_activity: null, last_payment_at: null,
+        });
+        speak('ఖాతా చేర్చాను.');
       }
       // created → the entry itself still goes through the two-step preview
       // (propose supplies the idempotency key + balance before/after)
@@ -1242,10 +1378,12 @@ async function saveEntries(list) {
       c = await api('/api/customers', { method: 'POST', body: { name: e.name, label: e.label || null, phone: e.phone || null } });
       state.customers.push({ ...c, balance: 0, last_activity: null, last_payment_at: null });
     }
+    let pre = c && typeof c.balance === 'number' ? c.balance : null;
     const tx = await api('/api/transactions', {
       method: 'POST',
       body: {
         customer_id: c.id, type: e.type, amount: e.amount,
+        payment_mode: e.payment_mode || 'cash',
         raw_transcript: e.raw || (e.customer_id ? '' : e.name),
         // keys come from the preview when propose made one; batch/screen entries
         // mint their own, so a dropped connection can never double-post
@@ -1253,9 +1391,16 @@ async function saveEntries(list) {
         source: e.source || 'voice',
       },
     });
-    saved.push({ entry: e, customer: c, tx });
+    saved.push({ entry: e, customer: c, tx, pre: pre });
   }
   await refreshHome();
+  // a payment that leaves a tiny remainder gets ONE explicit write-off offer
+  for (const s of saved) {
+    if (s.pre == null || s.entry.type !== 'pay') continue;
+    const now = (state.customers || []).find(x => x.id === s.customer.id);
+    const after = now && typeof now.balance === 'number' ? now.balance : null;
+    if (after != null) offerWriteOff(s.customer.id, 'receivable', s.pre, after);
+  }
   return saved;
 }
 // remember how the shopkeeper spoke it, so next time it resolves exactly
@@ -1708,6 +1853,7 @@ async function viewCustomer(id) {
     </div>
     <div class="actions">
       <button id="payBtn" class="btn primary" type="button">💰 చెల్లింపు తీసుకోండి · Receive payment</button>
+      <button id="stmtBtn" class="btn" type="button">🧾 స్టేట్‌మెంట్ · Statement</button>
       <button id="editBtn" class="btn" type="button">✏️ మార్చండి · Edit</button>
       <button id="mergeBtn" class="btn" type="button">🔗 డూప్లికేట్ కలపండి · Merge</button>
       <button id="remindBtn" class="btn" type="button">🔊 రిమైండర్ · Reminder</button>
@@ -1715,6 +1861,8 @@ async function viewCustomer(id) {
     <div id="payForm" class="card" hidden>
       <label class="field" for="payAmt">మొత్తం · Amount (₹)</label>
       <input id="payAmt" class="input" type="number" inputmode="numeric" min="1" placeholder="500">
+      <span class="field-label">చెల్లింపు ఎలా? · Payment mode</span>
+      ${payModeChips('payModeWrap', 'cash')}
       <div id="payErr" class="err" hidden></div>
       <button id="paySave" class="btn primary big" type="button">జమ చేయండి · Receive</button>
     </div>
@@ -1725,6 +1873,10 @@ async function viewCustomer(id) {
       <input id="edLabel" class="input" maxlength="60" value="${esc(c.label || '')}" placeholder="tailor, driver…">
       <label class="field" for="edPhone">ఫోన్ · Phone</label>
       <input id="edPhone" class="input" type="tel" inputmode="numeric" maxlength="10" value="${esc(c.phone || '')}">
+      <label class="field" for="edLimit">క్రెడిట్ లిమిట్ (₹, ఐచ్ఛికం) · Credit limit (optional)</label>
+      <input id="edLimit" class="input" inputmode="numeric" value="${esc(c.credit_limit != null ? c.credit_limit : '')}" placeholder="లేదు · none">
+      <label class="field" for="edProm">వాగ్దానం తేదీ (ఐచ్ఛికం) · Promise date (optional)</label>
+      <input id="edProm" class="input" type="date" value="${esc(c.promise_date || '')}">
       <div id="edErr" class="err" hidden></div>
       <button id="edSave" class="btn primary big" type="button">సేవ్ చేయండి · Save</button>
     </div>
@@ -1757,16 +1909,22 @@ async function viewCustomer(id) {
   toggle('#payBtn', '#payForm');
   toggle('#editBtn', '#editForm');
   toggle('#mergeBtn', '#mergeForm');
+  const payEntry = { payment_mode: 'cash' };
+  wirePayChips('#payModeWrap', payEntry);
+
+  $('#stmtBtn').onclick = () => { location.hash = '#/print/customer/' + c.id; };
 
   $('#paySave').onclick = async () => {
     const amt = Math.round(Number($('#payAmt').value));
     if (!Number.isFinite(amt) || amt <= 0) return showErr($('#payErr'), 'మొత్తం 0 కంటే ఎక్కువ ఉండాలి');
+    const before = typeof c.balance === 'number' ? c.balance : 0;
     const b = $('#paySave'); b.disabled = true;
     try {
       await api('/api/transactions', {
         method: 'POST',
         body: {
           customer_id: c.id, type: 'pay', amount: amt,
+          payment_mode: payEntry.payment_mode || 'cash',
           raw_transcript: 'receive payment (screen)',
           idempotency_key: newKey(), // screen entries are idempotent too
           source: 'screen',
@@ -1777,9 +1935,13 @@ async function viewCustomer(id) {
       await refreshHome();
       await loadTimeline(c.id);
       speak(`${fmtINR(amt)} జమ నమోదు చేశాను.`);
+      const now = (state.customers || []).find(x => x.id === c.id);
+      const after = now && typeof now.balance === 'number' ? now.balance : Math.max(0, before - amt);
+      offerWriteOff(c.id, 'receivable', before, after);
     } catch (e) {
       if (e.status === 401) return goLogin();
       showErr($('#payErr'), e.message);
+      b.disabled = false;
     } finally { b.disabled = false; }
   };
   $('#edSave').onclick = async () => {
@@ -1788,9 +1950,18 @@ async function viewCustomer(id) {
     const phone = $('#edPhone').value.replace(/\s+/g, '');
     if (!name) return showErr($('#edErr'), 'పేరు తప్పనిసరి');
     if (phone && !/^[6-9]\d{9}$/.test(phone)) return showErr($('#edErr'), '10 అంకెల సరైన మొబైల్ నంబర్ వేయండి');
+    const limitRaw = $('#edLimit').value.trim();
+    const body = {
+      name, label, phone,
+      credit_limit: limitRaw === '' ? null : Number(limitRaw),
+      promise_date: $('#edProm').value || null,
+    };
+    if (limitRaw !== '' && !(Number(limitRaw) >= 0)) {
+      return showErr($('#edErr'), 'క్రెడిట్ లిమిట్ సరికాదు · invalid credit limit');
+    }
     const b = $('#edSave'); b.disabled = true;
     try {
-      await api('/api/customers/' + c.id, { method: 'PATCH', body: { name, label, phone } });
+      await api('/api/customers/' + c.id, { method: 'PATCH', body });
       await loadCustomers();
       await viewCustomer(c.id);
     } catch (e) {
@@ -1801,6 +1972,153 @@ async function viewCustomer(id) {
   };
   try { await loadTimeline(c.id); }
   catch (e) { if (e.status === 401) return goLogin(); showErr($('#derr'), e.message); }
+}
+// ================= #/print/customer/:id — A4 statement =================
+// Date range + running balance + shop header + window.print()/WhatsApp share.
+const EV_TE_PRINT = {
+  goods_credit: 'సరుకు ఉద్దెర · Goods credit', repayment: 'జమ · Repayment',
+  opening_balance: 'ఓపెనింగ్ బ్యాలెన్స్ · Opening balance', discount: 'రాయితీ · Discount',
+  reversal: 'రద్దు · Reversal', produce_delivery: 'సరుకు · Delivery',
+  advance: 'అడ్వాన్స్ · Advance', deduction: 'తగ్గింపు · Deduction', payment: 'చెల్లింపు · Payment',
+};
+async function viewPrintCustomer(id, q) {
+  const shop = await ensureShop();
+  if (!shop) return;
+  const s = state.shop || {};
+  const from = q && q.from ? String(q.from) : '';
+  const to = q && q.to ? String(q.to) : '';
+  let d;
+  try {
+    const qs = [];
+    if (from) qs.push('from=' + encodeURIComponent(from));
+    if (to) qs.push('to=' + encodeURIComponent(to));
+    d = await api('/api/statements/customer/' + encodeURIComponent(id) + (qs.length ? '?' + qs.join('&') : ''));
+  } catch (e) {
+    if (e.status === 401) return goLogin();
+    return appEl().innerHTML = `<main class="screen"><div class="err">${esc(e.message || 'స్టేట్‌మెంట్ దొరకలేదు')}</div></main>`;
+  }
+  const c = d.customer || {};
+  const head = esc(s.shop_name || '') + (s.address ? `<small>${esc(s.address)}</small>` : '');
+  const waText = statementWaText(s, c, d);
+  appEl().innerHTML = `
+  <main class="screen">
+    <div class="card print-sheet">
+      <div class="ps-header">${head}<small>ఖాతా స్టేట్‌మెంట్ · Customer statement</small>
+        <b>${esc(c.name || '')}</b>${c.kind === 'farmer' ? '<small>రైతు · farmer</small>' : ''}</div>
+      <div class="ps-form">
+        <label class="field" for="psFrom">నుండి From</label><input id="psFrom" class="input" type="date" value="${esc(from)}">
+        <label class="field" for="psTo">వరకు To</label><input id="psTo" class="input" type="date" value="${esc(to)}">
+        <button id="psApply" class="btn small" type="button">చూడండి · Apply</button>
+      </div>
+      ${(from || to) ? `<div class="ps-meta">${esc(from || '…')} → ${esc(to || '…')}</div>` : ''}
+      <table class="ps-table">
+        <thead><tr><th>తేదీ Date</th><th>వివరం Detail</th><th>అవుట్ Out</th><th>ఇన్ In</th><th>మిగతా Balance</th></tr></thead>
+        <tbody>
+          ${Number(d.opening) !== 0 ? `<tr><td>—</td><td>ఓపెనింగ్ · Opening</td><td>${d.opening > 0 ? esc(fmtINR(d.opening)) : ''}</td><td>${d.opening < 0 ? esc(fmtINR(-d.opening)) : ''}</td><td>${esc(fmtINR(d.opening))}</td></tr>` : ''}
+          ${(d.transactions || []).map(t => `<tr>
+            <td>${esc(istDay(new Date(t.created_at)))}</td>
+            <td>${esc(EV_TE_PRINT[t.event] || EV_TE_PRINT[t.type === 'credit' ? 'goods_credit' : 'repayment'] || '')}${t.status === 'reversed' ? ' (రద్దు reversed)' : ''}${t.payment_mode && t.type === 'pay' && t.event !== 'reversal' ? ' · ' + esc(String(t.payment_mode).toUpperCase()) : ''}${t.reason ? ' — ' + esc(String(t.reason).slice(0, 60)) : ''}</td>
+            <td>${t.type === 'pay' ? esc(fmtINR(t.amount)) : ''}</td>
+            <td>${t.type === 'credit' ? esc(fmtINR(t.amount)) : ''}</td>
+            <td>${esc(fmtINR(t.running))}</td>
+          </tr>`).join('')}
+        </tbody>
+        <tfoot><tr><td colspan="4"><b>${(d.transactions || []).length} నమోదులు · entries · క్లోజింగ్ Closing:</b></td>
+          <td><b class="${Number(d.closing) > 0 ? 'owed' : ''}">${esc(fmtINR(d.closing))}</b></td></tr></tfoot>
+      </table>
+      <div class="ps-actions no-print">
+        <button id="psPrint" class="btn primary" type="button">🖨 ప్రింట్ · Print</button>
+        <a id="psWa" class="btn" target="_blank" rel="noopener" href="https://wa.me/?text=${encodeURIComponent(waText)}">💬 WhatsApp</a>
+        <a class="btn ghost" href="${c.kind === 'farmer' ? '#/rythu/farmer/' + esc(c.id) : '#/customer/' + esc(c.id)}">‹ వెనుకకు</a>
+      </div>
+    </div>
+  </main>`;
+  $('#psPrint').onclick = () => window.print();
+  $('#psApply').onclick = () => {
+    const f = $('#psFrom').value, t = $('#psTo').value;
+    const p = [];
+    if (f) p.push('from=' + f);
+    if (t) p.push('to=' + t);
+    location.hash = '#/print/customer/' + id + (p.length ? '?' + p.join('&') : '');
+  };
+}
+function statementWaText(s, c, d) {
+  const L = [];
+  L.push((s.shop_name || 'Khata Vani') + (s.address ? ', ' + s.address : ''));
+  L.push('ఖాతా స్టేట్‌మెంట్ · Account statement');
+  L.push('పేరు: ' + (c.name || ''));
+  if (d.from || d.to) L.push('కాలం: ' + (d.from || '…') + ' → ' + (d.to || '…'));
+  L.push('ఓపెనింగ్: ₹' + (d.opening != null ? d.opening : 0));
+  for (const t of (d.transactions || [])) {
+    L.push(istDay(new Date(t.created_at)) + ' · ' + (EV_TE_PRINT[t.event] || (t.type === 'credit' ? 'ఉద్దెర' : 'జమ')).split(' · ')[0] +
+      ' · ' + (t.type === 'credit' ? '+' : '−') + t.amount +
+      (t.type === 'pay' && t.payment_mode && t.event !== 'reversal' ? ' (' + t.payment_mode + ')' : '') +
+      ' · మిగతా ' + t.running);
+  }
+  L.push('క్లోజింగ్ బాకీ: ₹' + (d.closing != null ? d.closing : 0));
+  return L.join('\n');
+}
+function istDay(d) {
+  try { return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(d); }
+  catch (_) { return new Date(d).toISOString().slice(0, 10); }
+}
+// ================= #/print/slip/:sid — పట్టీ (settlement slip) =================
+async function viewPrintSlip(sid) {
+  const shop = await ensureShop();
+  if (!shop) return;
+  const s = state.shop || {};
+  let d;
+  try {
+    d = await api('/api/statements/settlement/' + encodeURIComponent(sid));
+  } catch (e) {
+    if (e.status === 401) return goLogin();
+    return appEl().innerHTML = `<main class="screen"><div class="err">${esc(e.message || 'పట్టీ దొరకలేదు')}</div></main>`;
+  }
+  const st = d.settlement || {};
+  const lines = [];
+  const push = (title, list, catMap) => {
+    for (const r of (list || [])) {
+      lines.push(`${title}${r.deduction_category && catMap ? ' (' + (catMap[r.deduction_category] || r.deduction_category) + ')' : ''}: ₹${r.amount} (${istDay(new Date(r.created_at))})`);
+    }
+  };
+  push('అడ్వాన్స్', d.advances);
+  push('తగ్గింపు', d.deductions, RY_CAT_TE);
+  push('చెల్లింపు', d.payments);
+  const waText = [
+    (s.shop_name || 'Khata Vani'),
+    'పట్టీ · Settlement slip',
+    'రైతు: ' + ((d.customer && d.customer.name) || ''),
+    `${st.produce || ''} ${st.quantity || '?'} ${st.unit || ''} × ₹${st.rate != null ? st.rate : '?'} = ₹${st.gross}`,
+    ...lines,
+    d.deduction_total > 0 ? 'కమీషన్/తగ్గింపుల మొత్తం: ₹' + d.deduction_total : '',
+    'నికర మిగిలింది · Remaining: ₹' + (d.remaining != null ? d.remaining : 0),
+  ].filter(Boolean).join('\n');
+  appEl().innerHTML = `
+  <main class="screen">
+    <div class="card print-sheet">
+      <div class="ps-header">${esc(s.shop_name || '')}${s.address ? `<small>${esc(s.address)}</small>` : ''}
+        <small>పట్టీ · Settlement slip</small>
+        <b>${esc((d.customer && d.customer.name) || '')}${d.customer && d.customer.village ? ' · ' + esc(d.customer.village) : ''}</b></div>
+      <div class="ps-gross">
+        <b>${esc(PROD_TE[st.produce] || st.produce || '')}</b>
+        <span>${esc(String(st.quantity != null ? st.quantity : '?'))} ${esc(ryUnitTe(st.unit) || st.unit || '')} × ₹${esc(String(st.rate != null ? st.rate : '?'))}</span>
+        <b>${esc(fmtINR(st.gross))}</b>
+      </div>
+      <ul class="ps-lines">
+        ${(d.advances || []).map(r => `<li>అడ్వాన్స్ · Advance <span>${esc(fmtINR(r.amount))}</span><small>${esc(istDay(new Date(r.created_at)))}</small></li>`).join('')}
+        ${(d.deductions || []).map(r => `<li>తగ్గింపు${r.deduction_category ? ' (' + esc(RY_CAT_TE[r.deduction_category] || r.deduction_category) + ')' : ''} <span>${esc(fmtINR(r.amount))}</span><small>${esc(istDay(new Date(r.created_at)))}</small></li>`).join('')}
+        ${(d.payments || []).map(r => `<li>చెల్లింపు${r.payment_mode ? ' (' + esc(String(r.payment_mode).toUpperCase()) + ')' : ''} <span>${esc(fmtINR(r.amount))}</span><small>${esc(istDay(new Date(r.created_at)))}</small></li>`).join('')}
+      </ul>
+      <div class="ps-total">నికర మిగిలింది · Remaining: <b>${esc(fmtINR(d.remaining))}</b>
+        ${d.open ? '' : '<small>(తీర్చింది · settled)</small>'}</div>
+      <div class="ps-actions no-print">
+        <button id="psPrint" class="btn primary" type="button">🖨 ప్రింట్ · Print</button>
+        <a id="psWa" class="btn" target="_blank" rel="noopener" href="https://wa.me/?text=${encodeURIComponent(waText)}">💬 WhatsApp</a>
+        ${d.customer ? `<a class="btn ghost" href="#/rythu/farmer/${esc(d.customer.id)}">‹ వెనుకకు</a>` : ''}
+      </div>
+    </div>
+  </main>`;
+  $('#psPrint').onclick = () => window.print();
 }
 function renderMergeList(c) {
   const box = $('#mergeList');
@@ -1849,10 +2167,15 @@ async function loadTimeline(id) {
     const isRev = t.event === 'reversal';
     const ackable = !isRev && !reversed && ACKABLE_EVENT(t);
     const sign = t.type === 'credit' ? '+' : '−';
-    const em = isRev ? 'రద్దు చేసింది · reversal' : (t.type === 'credit' ? 'ఉద్దెర' : 'జమ');
+    const evTe = { opening_balance: 'ఓపెనింగ్ బ్యాలెన్స్ · Opening balance', discount: 'రాయితీ · Discount' }[t.event];
+    const modeTag = t.payment_mode && t.type === 'pay' && t.event !== 'reversal'
+      ? ` <small class="pm-tag">${esc(String(t.payment_mode).toUpperCase())}</small>` : '';
+    const em = isRev ? 'రద్దు చేసింది · reversal'
+      : evTe ? evTe
+      : (t.type === 'credit' ? 'ఉద్దెర' : 'జమ');
     const head = isRev
       ? `↺ ${esc(em)} ${sign === '+' ? '+' : '−'}${esc(fmtINR(t.amount))}`
-      : `${sign}${esc(fmtINR(t.amount))} <em>${esc(em)}</em>`;
+      : `${sign}${esc(fmtINR(t.amount))} <em>${esc(em)}</em>${modeTag}`;
     return `
     <div class="tl-item${reversed ? ' reversed' : ''}${isRev ? ' is-reversal' : ''}">
       <span class="tl-dot ${t.type}"></span>
@@ -2243,6 +2566,8 @@ function askRythuNewFarmer(entry) {
     <input id="ryName" class="input" maxlength="100" value="${esc((entry && entry.name) || '')}">
     <label class="field" for="ryVillage">గ్రామం (ఐచ్ఛికం) · Village (optional)</label>
     <input id="ryVillage" class="input" maxlength="60">
+    <label class="field" for="ryOpen">పాత బాకీ / ఓపెనింగ్ అడ్వాన్స్ (ఐచ్ఛికం) · Opening advance (optional)</label>
+    <input id="ryOpen" class="input" inputmode="numeric" placeholder="0">
     <div id="ryErr" class="err" hidden></div>
     <div class="confirm-actions">
       <button id="ryYes" class="btn primary" type="button">✅ చేర్చండి</button>
@@ -2254,11 +2579,16 @@ function askRythuNewFarmer(entry) {
     const name = ($('#ryName').value || '').trim();
     const village = ($('#ryVillage').value || '').trim() || null;
     if (!name) return showErr($('#ryErr'), 'పేరు తప్పనిసరి');
+    const openRaw = ($('#ryOpen') ? $('#ryOpen').value.trim() : '');
+    if (openRaw && !(Number(openRaw) > 0)) return showErr($('#ryErr'), 'ఓపెనింగ్ మొత్తం సరికాదు · invalid opening amount');
     const b = $('#ryYes'); b.disabled = true;
     try {
-      const c = await api('/api/customers', { method: 'POST', body: { name, village, kind: 'farmer' } });
+      const c = await api('/api/customers', {
+        method: 'POST',
+        body: { name, village, kind: 'farmer', opening_balance: openRaw || undefined },
+      });
       state.rythuFarmers = state.rythuFarmers || [];
-      state.rythuFarmers.push({ id: c.id, name: c.name, village: c.village || null, payable: 0, advance: 0, open_settlements: 0 });
+      state.rythuFarmers.push({ id: c.id, name: c.name, village: c.village || null, payable: Number(openRaw) > 0 ? Number(openRaw) : 0, advance: 0, open_settlements: 0 });
       pending = null;
       clearFlow();
       speak(`${c.name} చేర్చాను.`);
@@ -2514,6 +2844,8 @@ function renderRythuConfirm() {
         <input id="ryAmt" class="input" type="number" inputmode="numeric" step="1" min="1" value="${esc(e.amount != null ? Math.round(e.amount) : '')}">
         ${e.event === 'deduction' ? `<div class="chips-wrap" id="ryCatChips">${RY_CAT_UI.map(([te, en]) =>
           `<button class="chip-btn${e.category === en ? ' on' : ''}" data-cat="${en}" type="button">${te}</button>`).join('')}</div>` : ''}
+        <span class="field-label">చెల్లింపు ఎలా? · Payment mode</span>
+        ${payModeChips('ryPayMode', e.payment_mode)}
         <div class="bal-flip" id="ryFlip">${ryFlipHtml(e, e.amount || 0)}</div>
         <div class="settle-note" id="rySettleNote"></div>
       </div>`
@@ -2549,6 +2881,7 @@ function renderRythuConfirm() {
   });
   const amt = $('#ryAmt');
   if (amt) amt.addEventListener('input', () => { e.amount = Number(amt.value) || null; rySync(); });
+  wirePayChips('#ryPayMode', e);
   const adv = $('#ryAdv');
   if (adv) adv.onclick = () => { p.allowAdvance = !p.allowAdvance; renderRythuConfirm(); };
   // settlement pick (CHOOSE case)
@@ -2609,11 +2942,17 @@ async function onRythuYes() {
   if (!p || p.kind !== 'ry-single' || !el) return;
   el.querySelectorAll('button').forEach(b => { b.disabled = true; });
   try {
-    await postRythu(p.entry, { idempotency_key: p.key || newKey() });
+    const posted = await postRythu(p.entry, { idempotency_key: p.key || newKey() });
     pending = null;
     clearFlow();
     speak('నమోదు చేశాను. · saved');
     await refreshRythu().catch(() => {});
+    if (p.entry.event === 'delivery' && posted && posted.event === 'produce_delivery') {
+      const fid = p.entry.customerId;
+      const fa = (state.rythuFarmers || []).find(x => x.id === fid);
+      commissionOffer(fid, posted.id, (fa && fa.name) || '', Number(posted.amount) || 0,
+        posted.quantity, ryUnitTe(posted.unit || p.entry.unit));
+    }
   } catch (e) {
     const code = (e.data && e.data.code) || '';
     if (e.status === 401) return goLogin();
@@ -2622,6 +2961,93 @@ async function onRythuYes() {
     el.querySelectorAll('button').forEach(b => { b.disabled = false; });
     speak(e.message || 'సేవ్ కాలేదు, మళ్లీ ప్రయత్నించండి');
   }
+}
+// Commission suggestion (aadhati): after a delivery is saved the shop MAY post
+// a commission deduction — a suggestion card, never auto-posted. Entry modes:
+// flat ₹ / % of gross / per-unit × settlement quantity.
+function commissionOffer(farmerId, deliveryId, farmerName, gross, quantity, unitTe) {
+  const el = $('#panel');
+  if (!el) return;
+  const pct = state.shop && state.shop.commission_percent != null ? Number(state.shop.commission_percent) : null;
+  if (!(gross > 0)) return;
+  const calc = flat => {
+    if (!isFinite(Number(flat)) || !(Number(flat) > 0)) return 0;
+    const val = mode() === 'pct' ? gross * Number(flat) / 100
+      : mode() === 'unit' ? (Number(quantity) > 0 ? Number(quantity) * Number(flat) : 0)
+      : Number(flat); // flat
+    return Math.floor(val * 100 + 0.5) / 100; // half-up on paise
+  };
+  const def = mode() === 'pct' ? (pct || 0) : mode() === 'unit' ? '' : (pct ? calc(pct) : '');
+  const modes = { flat: 'స్థిర ₹ · Flat', pct: 'గ్రాస్ % · % of gross', unit: 'యూనిట్₹ × పరిమాణం · per unit' };
+  let modeVal = 'pct';
+  function mode() { return modeVal; }
+  el.innerHTML = `
+  <div class="card">
+    <div class="q-title">కమీషన్ నమోదు చేయాలా? · Record commission?</div>
+    <p class="q-sub"> ఈ పట్టీకి కమీషన్ (తగ్గింపు) నమోదు చేయవచ్చు · A commission deduction can be added to this settlement</p>
+    <div class="chips-wrap" id="cmMode">
+      <button class="chip-btn${modeVal === 'pct' ? ' on' : ''}" data-m="pct" type="button">${esc(modes.pct)}</button>
+      <button class="chip-btn" data-m="flat" type="button">${esc(modes.flat)}</button>
+      <button class="chip-btn" data-m="unit" type="button">${esc(modes.unit)}</button>
+    </div>
+    <label class="field" for="cmVal" id="cmValLabel">శాతం % · Percent (default ${esc(pct != null ? pct : '')})</label>
+    <input id="cmVal" class="input" type="number" inputmode="decimal" step="any" min="0" value="${esc(String(def === 0 ? '' : def))}">
+    <div class="bal-flip" id="cmPrev">…</div>
+    <div id="cmErr" class="err" hidden></div>
+    <div class="confirm-actions">
+      <button id="cmYes" class="btn primary" type="button">✅ నమోదు · Record</button>
+      <button id="cmNo" class="btn ghost" type="button">❌ వదులుకోండి · Skip</button>
+    </div>
+  </div>`;
+  const prev = $('#cmPrev'), val = $('#cmVal'), lab = $('#cmValLabel');
+  function upd() {
+    const amt = calc(val.value);
+    const shown = modeVal === 'pct' ? (Number(val.value) || 0) + '% of ' + fmtINR(gross) + ' = '
+      : modeVal === 'unit' ? '₹' + (val.value || 0) + ' × ' + esc(String(quantity != null ? quantity : '?')) + ' ' + esc(unitTe || '') + ' = '
+      : '';
+    if (prev) prev.innerHTML = shown + (amt > 0 ? fmtINR(amt) : '—');
+    const y = $('#cmYes'); if (y) y.disabled = !(amt > 0);
+  }
+  upd();
+  val.addEventListener('input', upd);
+  el.querySelector('#cmMode').addEventListener('click', ev => {
+    const b = ev.target.closest('[data-m]'); if (!b) return;
+    modeVal = b.dataset.m;
+    el.querySelectorAll('#cmMode .chip-btn').forEach(x => x.classList.toggle('on', x === b));
+    lab.textContent = modeVal === 'pct' ? 'శాతం % · Percent'
+      : modeVal === 'unit' ? '₹ / ' + esc(unitTe || 'యూనిట్') + ' · per-unit rate' : 'స్థిర మొత్తం ₹ · Flat amount';
+    val.value = '';
+    upd();
+  });
+  speak(`${farmerName}. కమీషన్ నమోదు చేయాలా?`);
+  $('#cmNo').onclick = clearFlow;
+  $('#cmYes').onclick = async () => {
+    const amt = calc(val.value);
+    if (!(amt > 0)) return showErr($('#cmErr'), 'మొత్తం 0 కంటే ఎక్కువ · amount must be positive');
+    const b = $('#cmYes'); b.disabled = true;
+    try {
+      await api('/api/transactions', {
+        method: 'POST',
+        body: {
+          customer_id: farmerId,
+          workflow: 'rythu', type: 'pay', event: 'deduction',
+          deduction_category: 'commission', amount: amt,
+          settlement_id: deliveryId,
+          payment_mode: 'cash',
+          raw_transcript: 'commission (screen)',
+          idempotency_key: 'comm:' + deliveryId, // one suggestion → at most one row
+          source: 'screen',
+        },
+      });
+      speak('కమీషన్ నమోదు అయింది. · commission recorded');
+      clearFlow();
+      await refreshRythu().catch(() => {});
+    } catch (e) {
+      if (e.status === 401) return goLogin();
+      showErr($('#cmErr'), e.message);
+      b.disabled = false;
+    }
+  };
 }
 // POST /api/transactions for one rythu entry; extra overriding fields allowed
 async function postRythu(e, extra) {
@@ -2636,6 +3062,7 @@ async function postRythu(e, extra) {
   } else {
     Object.assign(body, {
       type: 'pay', event: e.event, amount: Math.round(Number(e.amount)),
+      payment_mode: e.payment_mode || 'cash', // chips: cash/upi/bank/other
       settlement_id: e.settlement_id || undefined,
       deduction_category: e.event === 'deduction' ? e.category : undefined,
     });
@@ -2727,12 +3154,24 @@ function renderRythuBatch() {
           ${ryMissing(e).length ? `<small class="warn-note">⚠ ${esc(ryMissing(e).map(m => RY_MISS_TE[m] || m).join(', '))}</small>` : ''}</span>
         <button class="del" type="button" data-del="${i}" aria-label="తొలగించండి">🗑</button>
       </li>`).join('')}</ul>
+    ${p.entries.some(e => e.event !== 'delivery') ? `
+      <span class="field-label">చెల్లింపు ఎలా? · Payment mode (all cash rows)</span>
+      ${payModeChips('ryBatchPayMode', 'cash')}` : ''}
     <div class="confirm-actions">
       <button id="ryYes" class="btn primary" type="button">✅ అవును</button>
       <button id="ryNo" class="btn ghost" type="button">❌ కాదు</button>
     </div>
   </div>`;
   el.querySelectorAll('[data-del]').forEach(b => { b.onclick = () => { p.entries.splice(Number(b.dataset.del), 1); renderRythuBatch(); }; });
+  {
+    const batch = { payment_mode: 'cash' };
+    wirePayChips('#ryBatchPayMode', batch);
+    for (const e of p.entries) if (e.event !== 'delivery') e.payment_mode = 'cash';
+    const wrap = $('#ryBatchPayMode');
+    if (wrap) wrap.addEventListener('click', () => {
+      for (const e of p.entries) if (e.event !== 'delivery') e.payment_mode = batch.payment_mode;
+    });
+  }
   $('#ryNo').onclick = () => { pending = null; clearFlow(); speak('సరే, మళ్లీ చెప్పండి.'); };
   $('#ryYes').onclick = () => saveRythuBatch(0);
 }
@@ -2894,6 +3333,7 @@ async function viewRythuFarmer(id) {
     async cash(event, cat) {
       const open = await ryOpenSettlements(id);
       e.hidden = false;
+      const qfPay = { payment_mode: 'cash' };
       e.innerHTML = `
       <div class="q-title">${esc(ryEventTe(event))}</div>
       <label class="field" for="qfAmt">మొత్తం · Amount (₹)</label>
@@ -2901,11 +3341,14 @@ async function viewRythuFarmer(id) {
       ${event === 'deduction' ? `<p class="q-sub">తగ్గింపు రకం · Category</p>
         <div class="chips-wrap" id="qfCat">${RY_CAT_UI.map(([te, en]) =>
         `<button class="chip-btn${en === cat ? ' on' : ''}" data-v="${en}" type="button">${te}</button>`).join('')}</div>` : ''}
+      ${event !== 'deduction' ? `<span class="field-label">చెల్లింపు ఎలా? · Payment mode</span>
+        ${payModeChips('qfPayMode', 'cash')}` : ''}
       ${open.length > 1 ? `<label class="field" for="qfSettle">సెటిల్‌మెంట్ · Settlement</label>
         <select id="qfSettle" class="input">${open.map(s =>
         `<option value="${esc(s.settlement_id)}">${esc(PROD_TE[s.produce] || s.produce || '—')} · మిగిలింది ₹${esc(fmtINR(s.remaining))}</option>`).join('')}</select>` : ''}
       <div id="qfErr" class="err" hidden></div>
       <button id="qfSave" class="btn primary big" type="button">నమోదు · Save</button>`;
+      if (event !== 'deduction') wirePayChips('#qfPayMode', qfPay);
       if (event === 'deduction') {
         e.querySelector('#qfCat').addEventListener('click', ev => {
           const b = ev.target.closest('[data-v]'); if (!b) return;
@@ -2920,6 +3363,7 @@ async function viewRythuFarmer(id) {
         const body = {
           customer_id: id, workflow: 'rythu', type: 'pay', event,
           amount: Number(e.querySelector('#qfAmt').value),
+          payment_mode: event === 'deduction' ? 'cash' : (qfPay.payment_mode || 'cash'),
           raw_transcript: `${event} (screen)`, idempotency_key: newKey(), source: 'screen',
         };
         if (event === 'deduction') body.deduction_category = cat;
@@ -2940,10 +3384,19 @@ async function viewRythuFarmer(id) {
       if (settleId) body.settlement_id = settleId;
       btn.disabled = true;
       try {
-        await api('/api/transactions', { method: 'POST', body });
+        const posted = await api('/api/transactions', { method: 'POST', body });
         speak('నమోదు చేశాను. · saved');
         e.hidden = true;
         await viewRythuFarmer(id);
+        // delivery -> offer the (never auto) commission suggestion
+        if (body.event === 'produce_delivery' && posted && posted.id) {
+          commissionOffer(id, posted.id, f.name, Number(posted.amount) || 0,
+            posted.quantity, ryUnitTe(posted.unit || body.unit));
+        } else if (body.event === 'payment') {
+          // a payment leaving a small remainder -> ONE explicit write-off offer
+          const before = Number(d.balance) || 0;
+          offerWriteOff(id, 'payable', before, Math.max(0, before - Number(body.amount)));
+        }
       } catch (err) {
         btn.disabled = false;
         if (err.status === 401) return goLogin();
@@ -3047,6 +3500,7 @@ function rySettleCard(s) {
       <b>${esc(PROD_TE[s.produce] || s.produce || '—')}</b>
       <span class="sc-qty">${esc(String(s.quantity != null ? s.quantity : '?'))} ${esc(ryUnitTe(s.unit))} × ₹${esc(String(s.rate != null ? s.rate : '?'))}</span>
       ${badge}
+      ${!reversed ? `<a class="rev slip-link" href="#/print/slip/${esc(s.settlement_id)}" title="పట్టీ · Slip">🧾</a>` : ''}
       <span class="ack-chips">${ackChip}</span>
       ${ackSend}
       <button class="rev" type="button" data-rev-tx="${esc(s.settlement_id)}" aria-label="రద్దు చేయండి">⟲</button>
