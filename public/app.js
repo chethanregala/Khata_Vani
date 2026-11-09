@@ -33,6 +33,19 @@ function normalizeName(s) {
     .replace(/[\u200c\u200d]/g, '').replace(/\s+/g, ' ').trim();
 }
 function showErr(el, msg) { if (el) { el.textContent = msg; el.hidden = false; } }
+// non-blocking toast for save/error feedback (CSP-safe, class-driven)
+function toast(msg, kind) {
+  const t = document.createElement('div');
+  t.className = 'toast' + (kind === 'ok' ? ' ok' : kind === 'err' ? ' err' : '');
+  t.setAttribute('role', 'status');
+  t.textContent = msg;
+  document.body.appendChild(t);
+  requestAnimationFrame(() => t.classList.add('show'));
+  setTimeout(() => {
+    t.classList.remove('show');
+    setTimeout(() => t.remove(), 250);
+  }, 2600);
+}
 function hideErr(el) { if (el) { el.textContent = ''; el.hidden = true; } }
 // idempotency key minted in the browser when no server preview supplies one —
 // a retried confirm then reuses the SAME key and can never double-post
@@ -201,7 +214,7 @@ function viewVerify() {
     <div id="voiceSec">
       <h1>ధ్వని ధృవీకరణ</h1>
       <p class="sub">మీకు వినిపించిన పదాన్ని కింది పదాలలో ఎంచుకోండి</p>
-      <button id="listen" class="listen pulse" aria-label="వినండి">🔊</button>
+      <button id="listen" class="listen pulse" aria-label="వినండి"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><use href="#i-mic"/></svg></button>
       <p class="hint">వినండి</p>
       <a href="#" id="again" class="link">▶ మళ్లీ వినండి</a>
       <div id="options" class="options"></div>
@@ -638,6 +651,27 @@ function hideHeard() {
   if (el) { el.hidden = true; el.textContent = ''; }
 }
 function clearFlow() { pending = null; const p = $('#panel'); if (p) p.innerHTML = ''; }
+// "ఈ రోజు సారాంశం" — short template from today's totals (no LLM), spoken via
+// the existing /api/tts; speak() prints the text as the heard line on failure.
+function todaySummary(ry) {
+  let line;
+  if (ry) {
+    const s = state.rythuSummary || {};
+    line = 'ఈరోజు సరుకు కొనుగోలు ' + Math.round(Number(s.purchases) || 0) +
+      ' రూపాయలు, అడ్వాన్స్ లు ' + Math.round(Number(s.advances) || 0) +
+      ', చెల్లింపులు ' + Math.round(Number(s.payments) || 0) +
+      ' రూపాయలు. ఇప్పుడు మొత్తం చెల్లించాల్సినది ' +
+      Math.round(Number(s.payable_total) || 0) + ' రూపాయలు.';
+  } else {
+    const gross = (state.today || []).reduce((s, t) => s + (t.type === 'credit' ? Number(t.amount) || 0 : 0), 0);
+    const got = (state.today || []).reduce((s, t) => s + (t.type === 'pay' ? Number(t.amount) || 0 : 0), 0);
+    const n = (state.today || []).length;
+    line = 'ఈరోజు ' + n + ' నమోదులు జరిగాయి. ఇచ్చిన సరుకు ' + Math.round(gross) +
+      ' రూపాయల విలువైనది, వసూలు అయినది ' + Math.round(got) +
+      ' రూపాయలు. మొత్తం బాకీ డాష్ బోర్డు లో చూడండి.';
+  }
+  speak(line);
+}
 function setRecUI(on) {
   document.body.classList.toggle('recording', on);
   const w = $('#micWrap'); if (w) w.classList.toggle('rec', on);
@@ -656,9 +690,18 @@ function initialsOf(name) {
   const b = w[1] ? (w[1].trim()[0] || '') : '';
   return (a + b).toUpperCase();
 }
+// inline sprite icons (index.html <symbol>s): visual only, CSP-safe <use>
+const ICO = {
+  home: 'i-home', people: 'i-people', chart: 'i-chart', gear: 'i-gear',
+  mic: 'i-mic', send: 'i-send', reverse: 'i-reverse', share: 'i-share',
+  print: 'i-print', trash: 'i-trash', plus: 'i-plus',
+};
+const ico = (name, label) => `<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" ${label ? `role="img" aria-label="${esc(label)}"` : 'aria-hidden="true"'}><use href="#${ICO[name] || name}"/></svg>`;
 function topbar() {
   const s = state.shop || {};
-  return `<header class="topbar"><span class="shop-name">${esc(s.shop_name || '')}</span>
+  return `<header class="topbar">
+    <span class="shop-av" aria-hidden="true">${esc(initialsOf(s.shop_name || ''))}</span>
+    <span class="shop-name">${esc(s.shop_name || '')}</span>
     <button id="logout" class="logout" type="button">లాగ్ అవుట్</button></header>`;
 }
 function wireTopbar() {
@@ -670,14 +713,14 @@ function wireTopbar() {
 function tabbar(active) {
   const ry = state.mode === 'rythu';
   const tabs = [
-    ['#/home', '🎤', 'హోమ్', 'Home'],
-    ['#/customers', '👥', ry ? 'రైతులు' : 'కస్టమర్లు', ry ? 'Farmers' : 'Customers'],
-    ['#/dashboard', '📊', 'డాష్‌బోర్డ్', 'Dashboard'],
-    ['#/settings', '⚙️', 'సెట్టింగ్స్', 'Settings'],
+    ['#/home', 'home', 'హోమ్', 'Home'],
+    ['#/customers', 'people', ry ? 'రైతులు' : 'కస్టమర్లు', ry ? 'Farmers' : 'Customers'],
+    ['#/dashboard', 'chart', 'డాష్‌బోర్డ్', 'Dashboard'],
+    ['#/settings', 'gear', 'సెట్టింగ్స్', 'Settings'],
   ];
   return `<nav class="tabbar" aria-label="మెను">${tabs.map(([href, ic, te, en]) => `
     <a class="tab${active === href ? ' on' : ''}" href="${href}">
-      <span class="tab-ic">${ic}</span><span class="tab-te">${te}</span><span class="tab-en">${en}</span>
+      ${ico(ic)}<span class="tab-te">${te}</span><span class="tab-en">${en}</span>
     </a>`).join('')}</nav>`;
 }
 async function ensureShop() {
@@ -1305,7 +1348,7 @@ async function onYes() {
       }
       await saveEntries([p.entry]);
       clearFlow();
-      return speak('నమోదు చేశాను. · saved');
+      return toast('నమోదు చేశాను · saved','ok');speak('నమోదు చేశాను. · saved');
     }
     if (p.kind === 'new') {
       const name = ($('#ncName') && $('#ncName').value.trim()) || p.entry.name;
@@ -1448,7 +1491,7 @@ function renderBatch() {
         <span class="idx">${i + 1}</span>
         <span class="entry-main"><b>${esc(e.name)}</b><small>${typeTe(e.type)}${e.customerId ? '' : ' · కొత్తది'}</small></span>
         <span class="entry-amt ${amtClass(e.type)}">${esc(fmtINR(e.amount))}</span>
-        <button class="del" type="button" data-del="${i}" aria-label="తొలగించండి">🗑</button>
+        <button class="del" type="button" data-del="${i}" aria-label="తొలగించండి">${ico("trash")}</button>
       </li>`).join('')}</ul>
     <div class="confirm-actions">
       <button id="yes" class="btn primary" type="button">✅ అవును</button>
@@ -1466,7 +1509,7 @@ async function confirmBatch() {
   if (!p || p.kind !== 'batch') return;
   await saveEntries(p.entries.slice());
   clearFlow();
-  speak('నమోదు చేశాను.');
+  toast('నమోదు చేశాను · saved','ok');speak('నమోదు చేశాను.');
 }
 
 // ================= voice queries =================
@@ -1662,11 +1705,18 @@ function renderStrip() {
     if (t.type === 'credit') credit += Number(t.amount) || 0;
     else if (t.type === 'pay') pay += Number(t.amount) || 0;
   }
+  // hero lead = total outstanding across all customers (pure presentation sum)
+  const outstanding = (state.customers || []).reduce(
+    (s, c) => s + (Number(c.balance) > 0 ? Number(c.balance) : 0), 0);
   el.innerHTML = `
-    <div class="stat"><span class="stat-te">ఇచ్చిన ఉద్దెర</span><span class="stat-en">Credit given</span>
-      <b class="stat-val owed">${esc(fmtINR(credit))}</b></div>
-    <div class="stat"><span class="stat-te">వసూలైనది</span><span class="stat-en">Collected</span>
-      <b class="stat-val paid">${esc(fmtINR(pay))}</b></div>`;
+    <div class="hero-lead"><b>${esc(fmtINR(outstanding))}</b>
+      <span>మొత్తం బాకీ · Total outstanding</span></div>
+    <div class="strip">
+      <div class="stat"><span class="stat-te">ఇచ్చిన ఉద్దెర</span><span class="stat-en">Credit given today</span>
+        <b class="stat-val owed">${esc(fmtINR(credit))}</b></div>
+      <div class="stat"><span class="stat-te">వసూలైనది</span><span class="stat-en">Collected today</span>
+        <b class="stat-val paid">${esc(fmtINR(pay))}</b></div>
+    </div>`;
 }
 function renderRecent() {
   const el = $('#recent'); if (!el) return;
@@ -1705,27 +1755,29 @@ async function viewHome() {
   const ry = state.mode === 'rythu';
   appEl().innerHTML = `
   ${topbar()}
-  <main class="screen">
+  <main class="screen home-screen">
     ${ry
-      ? `<div class="strip" id="ryStrip">${skelRows(2)}</div>
+      ? `<div class="hero" id="ryStrip">${skelRows(2)}</div>
          <h2 class="section">రైతులు · Farmers</h2>
-         <div class="ry-add-row"><button id="ryAdd" class="btn ghost wide" type="button">➕ కొత్త రైతు · New farmer</button></div>
+         <div class="ry-add-row"><button id="ryAdd" class="btn ghost wide" type="button">${ico('plus')} కొత్త రైతు · New farmer</button></div>
          <div id="ryFarmers" class="tx-list">${skelRows(3)}</div>`
-      : `<div class="strip" id="strip">${skelRows(1)}</div>`}
-    <div class="mic-wrap" id="micWrap">
-      <span class="ring r1"></span><span class="ring r2"></span><span class="ring r3"></span>
-      <button id="mic" type="button" aria-label="మైక్">🎤</button>
-    </div>
+      : `<div class="hero" id="strip">${skelRows(1)}</div>`}
     <div id="heard" class="heard" hidden></div>
     <div id="say">నొక్కి మాట్లాడండి · Tap and speak</div>
     <div id="panel"></div>
+    <button id="tsBtn" class="btn ts-btn" type="button" aria-label="ఈ రోజు సారాంశం · Today's summary">${ico('chart')} ఈ రోజు సారాంశం · Today's summary</button>
     ${ry ? '' : `<h2 class="section">ఇటీవలి నమోదులు · Last 5 entries</h2>
     <div id="recent" class="tx-list">${skelRows(3)}</div>`}
     <div id="herr" class="err" hidden></div>
   </main>
+  <div class="mic-fab" id="micWrap">
+    <span class="ring r1"></span><span class="ring r2"></span><span class="ring r3"></span>
+    <button id="mic" type="button" aria-label="మాట్లాడండి · Record">${ico('mic')}</button>
+  </div>
   ${tabbar('#/home')}`;
   wireTopbar();
   $('#mic').onclick = toggleMic;
+  $('#tsBtn').onclick = () => todaySummary(ry);
   if (ry) $('#ryAdd').onclick = () => askRythuNewFarmer(null);
   try {
     if (ry) await refreshRythu();
@@ -1804,7 +1856,7 @@ function renderCustomers() {
       <span class="cust-right">
         <b class="bal ${c.balance > 0 ? 'owed' : ''}">${esc(fmtINR(c.balance || 0))}</b>
         ${c.balance < 0 ? `<small class="advance-note">${esc(ADVANCE_TE_EN)}</small>` : ''}
-        <button class="remind" type="button" data-remind="${esc(c.id)}" aria-label="రిమైండర్">🔊</button>
+        <button class="remind" type="button" data-remind="${esc(c.id)}" aria-label="రిమైండర్">${ico("share")}</button>
       </span>
     </div>`).join('');
   el.querySelectorAll('[data-open]').forEach(card => {
@@ -1852,11 +1904,11 @@ async function viewCustomer(id) {
       </div>
     </div>
     <div class="actions">
-      <button id="payBtn" class="btn primary" type="button">💰 చెల్లింపు తీసుకోండి · Receive payment</button>
-      <button id="stmtBtn" class="btn" type="button">🧾 స్టేట్‌మెంట్ · Statement</button>
-      <button id="editBtn" class="btn" type="button">✏️ మార్చండి · Edit</button>
-      <button id="mergeBtn" class="btn" type="button">🔗 డూప్లికేట్ కలపండి · Merge</button>
-      <button id="remindBtn" class="btn" type="button">🔊 రిమైండర్ · Reminder</button>
+      <button id="payBtn" class="btn primary" type="button">చెల్లింపు తీసుకోండి · Receive payment</button>
+      <button id="stmtBtn" class="btn" type="button">స్టేట్‌మెంట్ · Statement</button>
+      <button id="editBtn" class="btn" type="button">మార్చండి · Edit</button>
+      <button id="mergeBtn" class="btn" type="button">డూప్లికేట్ కలపండి · Merge</button>
+      <button id="remindBtn" class="btn" type="button">రిమైండర్ · Reminder</button>
     </div>
     <div id="payForm" class="card" hidden>
       <label class="field" for="payAmt">మొత్తం · Amount (₹)</label>
@@ -2027,8 +2079,8 @@ async function viewPrintCustomer(id, q) {
           <td><b class="${Number(d.closing) > 0 ? 'owed' : ''}">${esc(fmtINR(d.closing))}</b></td></tr></tfoot>
       </table>
       <div class="ps-actions no-print">
-        <button id="psPrint" class="btn primary" type="button">🖨 ప్రింట్ · Print</button>
-        <a id="psWa" class="btn" target="_blank" rel="noopener" href="https://wa.me/?text=${encodeURIComponent(waText)}">💬 WhatsApp</a>
+        <button id="psPrint" class="btn primary" type="button">${ico("print")} ప్రింట్ · Print</button>
+        <a id="psWa" class="btn" target="_blank" rel="noopener" href="https://wa.me/?text=${encodeURIComponent(waText)}">${ico("share")} WhatsApp</a>
         <a class="btn ghost" href="${c.kind === 'farmer' ? '#/rythu/farmer/' + esc(c.id) : '#/customer/' + esc(c.id)}">‹ వెనుకకు</a>
       </div>
     </div>
@@ -2112,8 +2164,8 @@ async function viewPrintSlip(sid) {
       <div class="ps-total">నికర మిగిలింది · Remaining: <b>${esc(fmtINR(d.remaining))}</b>
         ${d.open ? '' : '<small>(తీర్చింది · settled)</small>'}</div>
       <div class="ps-actions no-print">
-        <button id="psPrint" class="btn primary" type="button">🖨 ప్రింట్ · Print</button>
-        <a id="psWa" class="btn" target="_blank" rel="noopener" href="https://wa.me/?text=${encodeURIComponent(waText)}">💬 WhatsApp</a>
+        <button id="psPrint" class="btn primary" type="button">${ico("print")} ప్రింట్ · Print</button>
+        <a id="psWa" class="btn" target="_blank" rel="noopener" href="https://wa.me/?text=${encodeURIComponent(waText)}">${ico("share")} WhatsApp</a>
         ${d.customer ? `<a class="btn ghost" href="#/rythu/farmer/${esc(d.customer.id)}">‹ వెనుకకు</a>` : ''}
       </div>
     </div>
@@ -2162,7 +2214,10 @@ async function loadTimeline(id) {
   // Reversals replace deletion: an entry is never removed — a ⚖-offsetting row
   // and a 'reversed' flag preserve an auditable history. Reversal rows
   // themselves and anything already reversed offer no ⟲ action.
-  el.innerHTML = r.transactions.map(t => {
+  // visible: grouped by IST day with a small date divider
+  let html = '';
+  let lastDay = null;
+  for (const t of r.transactions) {
     const reversed = t.status === 'reversed';
     const isRev = t.event === 'reversal';
     const ackable = !isRev && !reversed && ACKABLE_EVENT(t);
@@ -2176,7 +2231,9 @@ async function loadTimeline(id) {
     const head = isRev
       ? `↺ ${esc(em)} ${sign === '+' ? '+' : '−'}${esc(fmtINR(t.amount))}`
       : `${sign}${esc(fmtINR(t.amount))} <em>${esc(em)}</em>${modeTag}`;
-    return `
+    const day = istDay(new Date(t.created_at));
+    if (day !== lastDay && !isRev) { html += `<div class="tl-day">${esc(day)}</div>`; lastDay = day; }
+    html += `
     <div class="tl-item${reversed ? ' reversed' : ''}${isRev ? ' is-reversal' : ''}">
       <span class="tl-dot ${t.type}"></span>
       <span class="tl-main">
@@ -2185,10 +2242,11 @@ async function loadTimeline(id) {
         ${reversed ? '<small class="rev-note">రద్దు చేయబడింది · reversed</small>' : ''}
       </span>
       <span class="ack-chips">${ackChipHtml(t.ack_status, t.id)}</span>
-      ${ackable ? `<button class="rev ack-send" type="button" data-ack-tx="${esc(t.id)}" aria-label="ధృవీకరణకు పంపు · Send for acknowledgement">📨</button>` : ''}
-      ${(!isRev && !reversed) ? `<button class="rev" type="button" data-rev-tx="${esc(t.id)}" aria-label="రద్దు చేయండి">⟲</button>` : ''}
+      ${ackable ? `<button class="rev ack-send" type="button" data-ack-tx="${esc(t.id)}" aria-label="ధృవీకరణకు పంపు · Send for acknowledgement">${ico("send")}</button>` : ''}
+      ${(!isRev && !reversed) ? `<button class="rev" type="button" data-rev-tx="${esc(t.id)}" aria-label="రద్దు చేయండి">${ico("reverse")}</button>` : ''}
     </div>`;
-  }).join('');
+  }
+  el.innerHTML = html;
   closeRevCard();
   // acknowledgement actions: 📨 opens the link/QR sheet; a disputed chip opens
   // the resolve card (note shown back to the shopkeeper)
@@ -2397,14 +2455,18 @@ function renderRythuStrip() {
   const el = $('#ryStrip'); if (!el) return;
   const s = state.rythuSummary || {};
   el.innerHTML = `
-    <div class="stat"><span class="stat-te">సరుకు కొనుగోలు</span><span class="stat-en">Purchases today</span>
-      <b class="stat-val owed">${esc(fmtINR(s.purchases || 0))}</b></div>
-    <div class="stat"><span class="stat-te">అడ్వాన్స్‌లు</span><span class="stat-en">Advances</span>
-      <b class="stat-val paid">${esc(fmtINR(s.advances || 0))}</b></div>
-    <div class="stat"><span class="stat-te">చెల్లింపులు</span><span class="stat-en">Payments</span>
-      <b class="stat-val paid">${esc(fmtINR(s.payments || 0))}</b></div>
-    <div class="stat"><span class="stat-te">చెల్లించాల్సినది</span><span class="stat-en">Payable now</span>
-      <b class="stat-val owed">${esc(fmtINR(s.payable_total || 0))}</b></div>`;
+    <div class="hero-lead"><b>${esc(fmtINR(s.payable_total || 0))}</b>
+      <span>చెల్లించాల్సిన మొత్తం · Total payable</span></div>
+    <div class="strip">
+      <div class="stat"><span class="stat-te">సరుకు కొనుగోలు</span><span class="stat-en">Purchases today</span>
+        <b class="stat-val">${esc(fmtINR(s.purchases || 0))}</b></div>
+      <div class="stat"><span class="stat-te">అడ్వాన్స్‌లు</span><span class="stat-en">Advances</span>
+        <b class="stat-val">${esc(fmtINR(s.advances || 0))}</b></div>
+      <div class="stat"><span class="stat-te">చెల్లింపులు</span><span class="stat-en">Payments</span>
+        <b class="stat-val">${esc(fmtINR(s.payments || 0))}</b></div>
+      <div class="stat"><span class="stat-te">చెల్లించాల్సినది</span><span class="stat-en">Payable now</span>
+        <b class="stat-val">${esc(fmtINR(s.payable_total || 0))}</b></div>
+    </div>`;
 }
 function renderRythuFarmers() {
   const el = $('#ryFarmers'); if (!el) return;
@@ -2945,7 +3007,7 @@ async function onRythuYes() {
     const posted = await postRythu(p.entry, { idempotency_key: p.key || newKey() });
     pending = null;
     clearFlow();
-    speak('నమోదు చేశాను. · saved');
+    toast('నమోదు చేశాను · saved','ok');speak('నమోదు చేశాను. · saved');
     await refreshRythu().catch(() => {});
     if (p.entry.event === 'delivery' && posted && posted.event === 'produce_delivery') {
       const fid = p.entry.customerId;
@@ -3106,7 +3168,7 @@ async function postRythuRetry(p, extra) {
     await postRythu(p.entry, Object.assign({ idempotency_key: p.key || newKey() }, extra || {}));
     pending = null;
     clearFlow();
-    speak('నమోదు చేశాను. · saved');
+    toast('నమోదు చేశాను · saved','ok');speak('నమోదు చేశాను. · saved');
     await refreshRythu().catch(() => {});
   } catch (e) {
     if (e.status === 401) return goLogin();
@@ -3152,7 +3214,7 @@ function renderRythuBatch() {
         <span class="idx">${i + 1}</span>
         <span class="entry-main"><b>${esc(e.name || '?')}</b><small>${esc(ryEntryLine(e))}</small>
           ${ryMissing(e).length ? `<small class="warn-note">⚠ ${esc(ryMissing(e).map(m => RY_MISS_TE[m] || m).join(', '))}</small>` : ''}</span>
-        <button class="del" type="button" data-del="${i}" aria-label="తొలగించండి">🗑</button>
+        <button class="del" type="button" data-del="${i}" aria-label="తొలగించండి">${ico("trash")}</button>
       </li>`).join('')}</ul>
     ${p.entries.some(e => e.event !== 'delivery') ? `
       <span class="field-label">చెల్లింపు ఎలా? · Payment mode (all cash rows)</span>
@@ -3182,7 +3244,7 @@ async function saveRythuBatch(i) {
   if (!e) {
     pending = null;
     clearFlow();
-    speak('నమోదు చేశాను. · saved');
+    toast('నమోదు చేశాను · saved','ok');speak('నమోదు చేశాను. · saved');
     return refreshRythu().catch(() => {});
   }
   try {
@@ -3385,7 +3447,7 @@ async function viewRythuFarmer(id) {
       btn.disabled = true;
       try {
         const posted = await api('/api/transactions', { method: 'POST', body });
-        speak('నమోదు చేశాను. · saved');
+        toast('నమోదు చేశాను · saved','ok');speak('నమోదు చేశాను. · saved');
         e.hidden = true;
         await viewRythuFarmer(id);
         // delivery -> offer the (never auto) commission suggestion
@@ -3475,6 +3537,10 @@ function rySettleCard(s) {
   const badge = reversed
     ? '<span class="badge settled">రద్దు · Reversed</span>'
     : s.open ? '<span class="badge open">ఓపెన్ · Open</span>' : '<span class="badge settled">ఇచ్చేసింది · Settled</span>';
+  // paid vs remaining: purely presentational (gross − remaining) / gross in 10%
+  const gp = Number(s.gross) || 0;
+  const paidPart = Math.max(0, Math.min(1, gp > 0 ? (gp - (Number(s.remaining) || 0)) / gp : (s.open ? 0 : 1)));
+  const pg = 'pg pg-' + Math.round(paidPart * 10);
   const rows = [];
   const push = (list, evLabel, catMap) => {
     for (const r of (list || [])) {
@@ -3482,7 +3548,7 @@ function rySettleCard(s) {
         <span class="ry-line-main"><b>${esc(evLabel)}${r.deduction_category ? ' · ' + esc(RY_CAT_TE[r.deduction_category] || r.deduction_category) : ''}</b>
           <small>${esc(timeOf(r.created_at))}</small></span>
         <b class="ry-amt">${esc(fmtINR(r.amount))}</b>
-        <button class="rev" type="button" data-rev-tx="${esc(r.id)}" aria-label="రద్దు చేయండి">⟲</button>
+        <button class="rev" type="button" data-rev-tx="${esc(r.id)}" aria-label="రద్దు చేయండి">${ico("reverse")}</button>
       </div>`);
     }
   };
@@ -3492,7 +3558,7 @@ function rySettleCard(s) {
   // the delivery row itself carries the acknowledgement chip + send action
   const ackChip = ackChipHtml(s.ack_status, s.settlement_id);
   const ackSend = !reversed
-    ? `<button class="rev ack-send" type="button" data-ack-tx="${esc(s.settlement_id)}" aria-label="ధృవీకరణకు పంపు · Send for acknowledgement">📨</button>`
+    ? `<button class="rev ack-send" type="button" data-ack-tx="${esc(s.settlement_id)}" aria-label="ధృవీకరణకు పంపు · Send for acknowledgement">${ico("send")}</button>`
     : '';
   return `
   <div class="settle-card">
@@ -3500,10 +3566,10 @@ function rySettleCard(s) {
       <b>${esc(PROD_TE[s.produce] || s.produce || '—')}</b>
       <span class="sc-qty">${esc(String(s.quantity != null ? s.quantity : '?'))} ${esc(ryUnitTe(s.unit))} × ₹${esc(String(s.rate != null ? s.rate : '?'))}</span>
       ${badge}
-      ${!reversed ? `<a class="rev slip-link" href="#/print/slip/${esc(s.settlement_id)}" title="పట్టీ · Slip">🧾</a>` : ''}
+      ${!reversed ? `<a class="rev slip-link" href="#/print/slip/${esc(s.settlement_id)}" title="పట్టీ · Slip">${ico("print")}</a>` : ''}
       <span class="ack-chips">${ackChip}</span>
       ${ackSend}
-      <button class="rev" type="button" data-rev-tx="${esc(s.settlement_id)}" aria-label="రద్దు చేయండి">⟲</button>
+      <button class="rev" type="button" data-rev-tx="${esc(s.settlement_id)}" aria-label="రద్దు చేయండి">${ico("reverse")}</button>
     </div>
     ${rows.length ? `<div class="sc-rows">${rows.join('')}</div>` : '<div class="sc-rows muted-small">ఈ సెటిల్‌మెంట్‌కు అనుబంధ నమోదులు లేవు</div>'}
     <div class="sc-tot">
@@ -3511,6 +3577,8 @@ function rySettleCard(s) {
       <span>అడ్వాన్స్ ₹${esc(fmtINR(s.advance_total || 0))}</span>
       <span>తగ్గింపు ₹${esc(fmtINR(s.deduction_total || 0))}</span>
       <span>చెల్లింపు ₹${esc(fmtINR(s.payment_total || 0))}</span>
+      <div class="${pg}" role="progressbar" aria-valuemin="0" aria-valuemax="100"
+        aria-valuenow="${Math.round(paidPart * 100)}" aria-label="చెల్లింపు · paid"><i></i></div>
       <span class="sc-rem">మిగిలింది <b>${esc(fmtINR(s.remaining))}</b></span>
     </div>
   </div>`;

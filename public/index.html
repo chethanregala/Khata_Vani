@@ -14,10 +14,23 @@
 <link rel="apple-touch-icon" href="/icon-192.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+Telugu:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Noto+Sans+Telugu:wght@400;500;600;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="styles.css">
 </head>
 <body>
+<!-- inline sprite: CSP-safe icons (_referenced via <use href="#i-*"> only) -->
+<svg xmlns="http://www.w3.org/2000/svg" hidden aria-hidden="true"><defs>
+<symbol id="i-home" viewBox="0 0 24 24"><path d="M3 11.5 12 4l9 7.5M5.5 10.5V20h13v-9.5"/></symbol>
+<symbol id="i-people" viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.1"/><path d="M3.4 19.5c.4-3.1 2.8-4.9 5.6-4.9s5.2 1.8 5.6 4.9"/><path d="M15.2 5.9a2.7 2.7 0 1 1 1.7 5.2M16.6 14.4c2.5.2 4.2 1.9 4.5 4.5"/></symbol>
+<symbol id="i-chart" viewBox="0 0 24 24"><path d="M5 20v-6M12 20V6M19 20v-9M3 20h18"/></symbol>
+<symbol id="i-gear" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.2"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.8 5.8l2.1 2.1M16.1 16.1l2.1 2.1M18.2 5.8l-2.1 2.1M7.9 16.1l-2.1 2.1"/></symbol>
+<symbol id="i-mic" viewBox="0 0 24 24"><path d="M12 3.5a3 3 0 0 1 3 3v5a3 3 0 0 1-6 0v-5a3 3 0 0 1 3-3M6.2 11.3a5.8 5.8 0 0 0 11.6 0M12 17.2V21M9 21h6"/></symbol>
+<symbol id="i-send" viewBox="0 0 24 24"><path d="M4.5 12 20 4.5 15.5 20 11 13.5 4.5 12ZM11 13.5 20 4.5"/></symbol>
+<symbol id="i-reverse" viewBox="0 0 24 24"><path d="M4.5 10a8 8 0 1 1 1.3 8.2M4.5 10V4.8M4.5 10h5.2"/></symbol>
+<symbol id="i-share" viewBox="0 0 24 24"><circle cx="6" cy="12" r="2.4"/><circle cx="17" cy="6.5" r="2.4"/><circle cx="17" cy="17.5" r="2.4"/><path d="M8.2 10.9l6.6-3.3M8.2 13.1l6.6 3.3"/></symbol>
+<symbol id="i-print" viewBox="0 0 24 24"><path d="M7 8.5V4h10v4.5M6.5 8.5h11a2 2 0 0 1 2 2V16H17v4H7v-4H3.5v-5.5a2 2 0 0 1 2-2ZM7 12h10"/></symbol>
+<symbol id="i-trash" viewBox="0 0 24 24"><path d="M5 7h14M9.5 7V4.5h5V7M6.5 7l1 13h9l1-13M10 11v5M14 11v5"/></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol></defs></svg>
 <div id="app"></div>
 <script src="parser.js"></script>
 <script src="rythu-parser.js"></script>
