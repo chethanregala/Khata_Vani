@@ -1,1 +1,29 @@
-{"name":"khata-vani","version":"0.2.0","type":"commonjs","engines":{"node":">=20"},"scripts":{"start":"node server.js","test":"node test-parser.js && node test-resolver.js && node test-security.js && node test-ledger.js && node tests/test-rythu.js && node tests/test-ack.js && node tests/test-business-type.js && node tests/test-accounting.js","smoke":"node scripts/smoke-rythu.js","seed":"node scripts/seed-demo.js","seed:clean":"node scripts/seed-demo.js --clean"},"dependencies":{"@supabase/supabase-js":"^2.118.0","bcryptjs":"^3.0.3","cookie-parser":"^1.4.7","dotenv":"^16.4.5","express":"^4.19.2","express-rate-limit":"^8.7.2","jsonwebtoken":"^9.0.3","qrcode":"^1.5.4"}}
+{
+  "name": "khata-vani",
+  "version": "0.2.0",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test-parser.js && node test-resolver.js && node test-security.js && node test-ledger.js && node tests/test-rythu.js && node tests/test-ack.js && node tests/test-business-type.js && node tests/test-accounting.js && node tests/test-audio.js",
+    "smoke": "node scripts/smoke-rythu.js",
+    "seed": "node scripts/seed-demo.js",
+    "seed:clean": "node scripts/seed-demo.js --clean",
+    "lint": "eslint ."
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.118.0",
+    "bcryptjs": "^3.0.3",
+    "cookie-parser": "^1.4.7",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "express-rate-limit": "^8.7.2",
+    "jsonwebtoken": "^9.0.3",
+    "qrcode": "^1.5.4"
+  },
+  "devDependencies": {
+    "eslint": "^9.39.5"
+  }
+}

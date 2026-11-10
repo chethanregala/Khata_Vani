@@ -119,7 +119,6 @@ function contentLength(maxBytes, message) {
 // non-sensitive error category + request id — never message bodies, PII or
 // upstream payloads.
 function errorHandler() {
-  // eslint-disable-next-line no-unused-vars
   return function securityErrorHandler(err, req, res, next) {
     if (res.headersSent) return next(err);
     const rid = (res.locals && res.locals.reqId) || '-';

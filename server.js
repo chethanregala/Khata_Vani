@@ -741,18 +741,44 @@ app.put('/api/me/business-type', async (req, res) => {
 // provider payloads or transcripts are ever logged or forwarded) ----
 const STT_FAIL_MSG = 'గుర్తించడం సాధ్యం కాలేదు, మళ్లీ చెప్పండి · transcription failed';
 const STT_TIMEOUT_MSG = 'గుర్తించడానికి సమయం ఎక్కువైంది, మళ్లీ చెప్పండి · transcription timed out';
+// language may be chosen per request (query) with STT_LANG as the env default.
+// Empty responses are retried once by the client with indic-auto (same audio).
+const STT_LANG_RE = /^(indic-auto|[a-z]{2}-IN(,[a-z]{2}-IN){0,3})$/;
+// custom terms: <=200 short phrases, documented Gnani Prisma v3.0 form field
+// "keyterms" (docs.gnani.ai/api/STT/models/prisma-v3#context). The client sends
+// them base64url(JSON) in X-KV-Terms; nothing here is ever logged.
+function sttTermsFromHeader(h) {
+  if (typeof h !== 'string' || !h || h.length > 12000) return [];
+  let arr;
+  try { arr = JSON.parse(Buffer.from(h, 'base64url').toString('utf8')); } catch (_) { return []; }
+  if (!Array.isArray(arr)) return [];
+  const out = [];
+  for (const raw of arr) {
+    if (typeof raw !== 'string') continue;
+    const t = raw.replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, 60);
+    if (!t || t.indexOf('<|') !== -1 || t.indexOf('|>') !== -1) continue;
+    if (out.indexOf(t) === -1) out.push(t);
+    if (out.length >= 200) break; // documented keyterms limit
+  }
+  return out;
+}
 app.post('/api/stt', shopApiLimiter, express.raw({ type: () => true, limit: '5mb' }), async (req, res) => {
   const ct = String(req.get('Content-Type') || '').toLowerCase();
   if (ct.indexOf('audio/') !== 0) return res.status(415).json({ error: 'ఆడియో ఫైల్ మాత్రమే పంపాలి · audio content required' });
   if (!Buffer.isBuffer(req.body) || req.body.length < 1000) {
     return res.status(400).json({ error: 'ఆడియో ఖాళీ/చాలా చిన్నది · empty or invalid audio body' });
   }
+  const t0 = Date.now();
+  const asked = String(req.query.lang || '').trim();
+  const lang = STT_LANG_RE.test(asked) ? asked : (E.STT_LANG || 'te-IN');
+  const terms = sttTermsFromHeader(req.get('X-KV-Terms'));
   try {
     const f = new FormData();
     f.append('audio_file', new Blob([req.body], { type: 'audio/wav' }), 'a.wav');
     f.append('model', 'prisma-v3.0');
     f.append('format', 'transcribe');
-    f.append('language_code', E.STT_LANG || 'indic-auto');
+    f.append('language_code', lang);
+    if (terms.length) f.append('keyterms', JSON.stringify(terms));
     let r;
     try {
       r = await fetch(B + '/stt/v3', {
@@ -760,25 +786,27 @@ app.post('/api/stt', shopApiLimiter, express.raw({ type: () => true, limit: '5mb
         signal: AbortSignal.timeout(STT_TIMEOUT_MS),
       });
     } catch (e) {
-      console.error('[stt] id=' + req.id + ' upstream ' + (timedOut(e) ? 'timeout' : 'network-error'));
+      console.error('[stt] id=' + req.id + ' upstream ' + (timedOut(e) ? 'timeout' : 'network-error') + ' ms=' + (Date.now() - t0));
       return res.status(timedOut(e) ? 504 : 502).json({ error: timedOut(e) ? STT_TIMEOUT_MSG : STT_FAIL_MSG });
     }
     if (!r.ok) {
       // never forward raw provider errors — map to a safe status + Telugu message
-      console.error('[stt] id=' + req.id + ' upstream-status=' + r.status);
+      console.error('[stt] id=' + req.id + ' upstream-status=' + r.status + ' ms=' + (Date.now() - t0));
       return res.status(502).json({ error: STT_FAIL_MSG });
     }
     let j = null;
     try { j = JSON.parse(await r.text()); } catch (_) {}
     if (!j || typeof j.transcript !== 'string') {
-      console.error('[stt] id=' + req.id + ' invalid-upstream-response');
+      console.error('[stt] id=' + req.id + ' invalid-upstream-response ms=' + (Date.now() - t0));
       return res.status(502).json({ error: STT_FAIL_MSG });
     }
-    console.log('[stt] id=' + req.id + ' upstream=200 transcript_chars=' + j.transcript.length);
+    // numbers only: language, term count, character count, duration — no content
+    console.log('[stt] id=' + req.id + ' upstream=200 lang=' + lang + ' terms=' + terms.length +
+      ' transcript_chars=' + j.transcript.length + ' ms=' + (Date.now() - t0));
     // forward only the fields the client uses — not the whole provider payload
     return res.json({ transcript: j.transcript, detected_language_code: j.detected_language_code || null });
   } catch (e) {
-    console.error('[stt] id=' + req.id + ' ' + (e && (e.code || e.name) || 'ERROR'));
+    console.error('[stt] id=' + req.id + ' ' + (e && (e.code || e.name) || 'ERROR') + ' ms=' + (Date.now() - t0));
     return res.status(500).json({ error: 'సర్వర్ సమస్య, మళ్లీ ప్రయత్నించండి' });
   }
 });
@@ -789,6 +817,7 @@ const TTS_TEXT_MAX = 1000;
 const TTS_FAIL_MSG = 'ధ్వని సిద్ధం కాలేదు, మళ్లీ ప్రయత్నించండి · speech service failed';
 const TTS_TIMEOUT_MSG = 'ధ్వని సేవ సమయం ముగిసింది, మళ్లీ ప్రయత్నించండి · speech service timed out';
 app.post('/api/tts', ttsApiLimiter, contentLength(8 * 1024), async (req, res) => {
+  const t0 = Date.now();
   const ct = String(req.get('Content-Type') || '').toLowerCase();
   if (ct.indexOf('application/json') !== 0) {
     return res.status(415).json({ error: 'JSON అభ్యర్థన కావాలి · application/json required' });
@@ -812,11 +841,11 @@ app.post('/api/tts', ttsApiLimiter, contentLength(8 * 1024), async (req, res) =>
   // local cache instead of the upstream TTS, avoiding 429 rate-limit 502s
   const out = await sentenceAudio(b.text.trim());
   if (!out.ok) {
-    console.error('[tts] id=' + req.id + ' upstream ' + out.kind + (out.status ? ' status=' + out.status : ''));
+    console.error('[tts] id=' + req.id + ' upstream ' + out.kind + (out.status ? ' status=' + out.status : '') + ' ms=' + (Date.now() - t0));
     return res.status(out.kind === 'timeout' ? 504 : 502)
       .json({ error: out.kind === 'timeout' ? TTS_TIMEOUT_MSG : TTS_FAIL_MSG });
   }
-  console.log('[tts] id=' + req.id + (out.cached ? ' cache=hit' : ' upstream=200') + ' bytes=' + out.buffer.length);
+  console.log('[tts] id=' + req.id + (out.cached ? ' cache=hit' : ' upstream=200') + ' bytes=' + out.buffer.length + ' ms=' + (Date.now() - t0));
   res.type('audio/wav').send(out.buffer);
 });
 

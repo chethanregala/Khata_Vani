@@ -69,6 +69,74 @@ function applyShop(shop) {
 // explain WHY the user was sent back (never shown on a fresh first visit)
 function markSessionExpired() { try { window.__kvSessionExpired = true; } catch (_) {} }
 
+// ---------- audio manager (BUG 4): ONE voice at a time ----------
+// Every sound the app plays — Gnani TTS clips, the login challenge audio —
+// goes through here: playing a new clip first stops the previous one, and
+// cancelAudio() runs on a new recording, a route change and a sheet close.
+// Browser speechSynthesis is never used alongside Gnani audio.
+let curAudio = null;                 // the only live Audio element
+let lastSpeak = { text: '', at: 0 }; // same text inside the window plays once
+const TTS_DEDUPE_MS = 3000;
+// pure dedupe rule (asserted in tests/test-audio.js): the SAME text requested
+// again inside the window stays silent; a different text or an old one plays.
+function ttsDedupeHit(st, text, now, ms) {
+  return !!st && st.text === String(text || '') && (now - st.at) < ms;
+}
+function ttsStale(text) { return ttsDedupeHit(lastSpeak, text, Date.now(), TTS_DEDUPE_MS); }
+function markTts(text) { lastSpeak = { text: String(text || ''), at: Date.now() }; }
+function cancelAudio() {
+  if (curAudio) {
+    try { curAudio.pause(); curAudio.currentTime = 0; } catch (_) {}
+    curAudio = null;
+  }
+  markTts(''); // resetting the dedupe window keeps fresh prompts audible
+}
+let speakGen = 0; // TTS fetches are async: stale responses are dropped, not played
+async function playAudioEl(a) {
+  cancelAudio();
+  curAudio = a;
+  const gen = speakGen;
+  await a.play().catch(() => {});
+  return gen === speakGen; // false when a newer sound superseded this one
+}
+
+// ---------- BUG 1: timing instrumentation (durations only, never content) ----------
+const kvTimings = [];
+function markTiming(name, ms) {
+  kvTimings.push({ name: String(name), ms: Math.round(Number(ms) || 0) });
+  if (kvTimings.length > 40) kvTimings.shift();
+  renderDebug();
+}
+function renderDebug() {
+  const el = document.getElementById('dbg');
+  if (!el || el.hidden) return;
+  el.innerHTML = kvTimings.slice(-12).map(t =>
+    `<div class="dbg-row"><span>${esc(t.name)}</span><span>${t.ms} ms</span></div>`).join('') ||
+    '<div class="dbg-row"><span>no timings yet</span><span>—</span></div>';
+}
+function toggleDebug() {
+  let el = document.getElementById('dbg');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'dbg'; el.className = 'dbg'; el.setAttribute('aria-hidden', 'true');
+    document.body.appendChild(el);
+  }
+  el.hidden = !el.hidden;
+  renderDebug();
+}
+// five quick taps on the logo toggle the hidden timing overlay
+(() => {
+  let taps = [];
+  document.addEventListener('click', ev => {
+    const t = ev.target;
+    if (!t || !t.closest || !t.closest('.logo')) return;
+    const now = Date.now();
+    taps = taps.filter(x => now - x < 2000);
+    taps.push(now);
+    if (taps.length >= 5) { taps = []; toggleDebug(); }
+  }, true);
+})();
+
 // ---------- logo (inline SVG) ----------
 function logoSVG() {
   return `<svg class="logo" viewBox="0 0 260 344" role="img" aria-label="ఖాతా వాణి Khata Vani" xmlns="http://www.w3.org/2000/svg">
@@ -90,6 +158,7 @@ function logoSVG() {
 // ---------- router ----------
 function route() {
   const view = (location.hash || '#/splash').split('?')[0];
+  cancelAudio(); // BUG 4: a route change never leaves the previous clip playing
   if (view.startsWith('#/rythu/farmer/')) return viewRythuFarmer(decodeURIComponent(view.slice('#/rythu/farmer/'.length)));
   if (view.startsWith('#/print/customer/')) {
     const i = view.indexOf('?');
@@ -256,8 +325,10 @@ function playChallenge() {
   if (!challenge) return;
   const btn = $('#listen');
   const a = new Audio(challenge.audioUrl);
-  const p = a.play();
+  // through the audio manager: the challenge stops any other clip first
+  const p = playAudioEl(a);
   if (p && p.catch) p.catch(() => { if (btn) btn.classList.add('pulse'); }); // autoplay blocked
+  // startRecording also cancels: the mic and the challenge can never overlap
 }
 
 async function answerChallenge(choice) {
@@ -639,18 +710,41 @@ async function viewSettings() {
 function say(msg) { const el = $('#say'); if (el) el.textContent = String(msg == null ? '' : msg); }
 // persistent "what I heard" line under the mic: shows the last transcript until
 // the next main-mic recording starts. Separate element -> say()/speak() later
-// messages can never overwrite it.
+// messages can never overwrite it. BUG 1: the text is EDITABLE and the
+// re-parse button fixes one misheard word by typing instead of re-speaking.
 function showHeard(raw) {
   const el = $('#heard');
   if (!el) return;
-  el.textContent = 'నేను విన్నది · I heard: ' + String(raw == null ? '' : raw);
+  el.innerHTML = `
+    <label class="heard-lab" for="heardIn">నేను విన్నది · I heard (editable)</label>
+    <div class="heard-row">
+      <input id="heardIn" class="input heard-in" value="${esc(String(raw == null ? '' : raw))}"
+        autocapitalize="off" autocomplete="off" spellcheck="false">
+      <button id="heardRe" class="chip-btn heard-re" type="button"
+        aria-label="మళ్లీ పార్స్ · re-parse">↻</button>
+    </div>`;
   el.hidden = false;
+  const go = () => {
+    const i = $('#heardIn');
+    const v = i && i.value.trim();
+    if (v) { clearFlow(); handleTranscript(v); }
+  };
+  const btn = $('#heardRe');
+  if (btn) btn.onclick = go;
+  const inp = $('#heardIn');
+  if (inp) inp.onkeydown = ev => { if (ev.key === 'Enter') { ev.preventDefault(); go(); } };
 }
 function hideHeard() {
   const el = $('#heard');
   if (el) { el.hidden = true; el.textContent = ''; }
 }
-function clearFlow() { pending = null; const p = $('#panel'); if (p) p.innerHTML = ''; }
+// shared footnote under every transaction list (acknowledgement is a record,
+// not legal proof) — declared here so every view can render it
+const ACK_FOOTNOTE = '<p class="ack-foot">📨 link ద్వారా ధృవీకరణ · not legal proof</p>';
+// the one in-progress voice/screen entry (declared before every handler that
+// reads it; the single-entry flow below fills it in)
+let pending = null; // { kind:'single'|'new'|'fuzzy'|'batch', ... }
+function clearFlow() { pending = null; cancelAudio(); const p = $('#panel'); if (p) p.innerHTML = ''; }
 // "ఈ రోజు సారాంశం" — short template from today's totals (no LLM), spoken via
 // the existing /api/tts; speak() prints the text as the heard line on failure.
 function todaySummary(ry) {
@@ -675,6 +769,11 @@ function todaySummary(ry) {
 function setRecUI(on) {
   document.body.classList.toggle('recording', on);
   const w = $('#micWrap'); if (w) w.classList.toggle('rec', on);
+  // BUG 1(e): the level meter is only meaningful while recording
+  if (!on) {
+    const lvl = $('#lvl');
+    if (lvl) { lvl.hidden = true; setLevel(0); }
+  }
 }
 function skelRows(n) {
   let s = '';
@@ -840,23 +939,54 @@ function wav(d, sr) {
   d.forEach((x, i) => v.setInt16(44 + i * 2, Math.max(-1, Math.min(1, x)) * 32767, true));
   return v.buffer;
 }
+// BUG 1(d): trim leading/trailing near-silence, keeping 120 ms of padding —
+// a clip shorter than 0.6 s after trimming is rejected before any upload.
+const SILENCE_RMS = 0.012;
+function trimSilence(pcm, sr) {
+  const n = pcm.length;
+  let peak = 0;
+  for (let i = 0; i < n; i++) { const v = Math.abs(pcm[i]); if (v > peak) peak = v; }
+  // a clip with no audible peak at all is returned as-is so the duration check
+  // can reject it with the gentle "say a little longer" message
+  if (!(peak > SILENCE_RMS)) return pcm;
+  let a = 0, b = n - 1;
+  while (a < n && Math.abs(pcm[a]) < SILENCE_RMS) a++;
+  while (b > a && Math.abs(pcm[b]) < SILENCE_RMS) b--;
+  const pad = Math.round(0.12 * sr);
+  a = Math.max(0, a - pad);
+  b = Math.min(n - 1, b + pad);
+  return pcm.subarray(a, b + 1);
+}
 async function toWav(blob) {
   const dec = await new AudioContext().decodeAudioData(await blob.arrayBuffer());
-  const off = new OfflineAudioContext(1, Math.ceil(dec.duration * 16000), 16000), s = off.createBufferSource();
+  const off = new OfflineAudioContext(1, Math.max(1, Math.ceil(dec.duration * 16000)), 16000), s = off.createBufferSource();
   s.buffer = dec; s.connect(off.destination); s.start();
-  return wav((await off.startRendering()).getChannelData(0), 16000);
+  const raw = (await off.startRendering()).getChannelData(0);
+  const pcm = trimSilence(raw, 16000);
+  return { buffer: wav(pcm, 16000), seconds: pcm.length / 16000 };
 }
 
-// ---------- TTS (one audio at a time) ----------
-let ttsAudio = null;
+// ---------- TTS (through the audio manager above) ----------
+// BUG 1(speed): identical sentences are fetched once per session — the server
+// also caches, so a repeat is instant and costs no Gnani credit.
+const ttsCache = new Map(); // text -> Blob (successful responses only)
 async function speak(text) {
   say(text);
+  const gen = ++speakGen;
+  if (ttsStale(text)) { markTts(text); return null; } // repeated sentence: silence
+  markTts(text);
   try {
-    if (ttsAudio) { try { ttsAudio.pause(); } catch (_) {} ttsAudio = null; }
-    const b = await apiAudio('/api/tts', { body: { text } });
+    let b = ttsCache.get(String(text));
+    if (!b) {
+      const t0 = performance.now();
+      b = await apiAudio('/api/tts', { body: { text } });
+      markTiming('tts', performance.now() - t0);
+      if (ttsCache.size >= 24) ttsCache.delete(ttsCache.keys().next().value);
+      if (b) ttsCache.set(String(text), b);
+    }
+    if (gen !== speakGen) return b; // superseded while downloading — never play
     const a = new Audio(URL.createObjectURL(b));
-    ttsAudio = a;
-    await a.play().catch(() => {});
+    await playAudioEl(a);
     return b;
   } catch (e) {
     if (e.status === 401) return goLogin();
@@ -872,6 +1002,7 @@ async function speak(text) {
 // ================= recording =================
 let activeRec = null, micBusy = false;
 async function startRecording() {
+  cancelAudio(); // BUG 4: a new recording always silences the previous clip
   // unsupported browser: no getUserMedia / MediaRecorder / AudioContext ->
   // a clear message; every mic card also has a manual-entry form fallback
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia ||
@@ -879,7 +1010,12 @@ async function startRecording() {
     throw new Error('ఈ బ్రౌజర్‌లో మైక్ సదుపాయం లేదు — చేతితో రాయండి · mic unsupported, use manual entry');
   }
   let stream;
-  try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
+  try {
+    // BUG 1(c): mono + echo/noise/AGC processing improves accuracy
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+  }
   catch (e) {
     const n = e && e.name;
     if (n === 'NotFoundError' || n === 'DevicesNotFoundError' || n === 'OverconstrainedError') {
@@ -890,34 +1026,127 @@ async function startRecording() {
   const rec = new MediaRecorder(stream);
   const chunks = [];
   rec.ondataavailable = e => chunks.push(e.data);
+
+  // BUG 1(e)+(f): live level meter; auto-stop after 8 s of silence once speech
+  // started, hard cap 20 s (the timer below). Analyser failures are harmless.
+  let lvlTimer = null, actx = null;
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    actx = new AC();
+    const src = actx.createMediaStreamSource(stream);
+    const an = actx.createAnalyser();
+    an.fftSize = 1024;
+    src.connect(an);
+    const buf = new Uint8Array(an.fftSize);
+    let heardSpeech = false, silentMs = 0;
+    const lv = $('#lvl'); if (lv) lv.hidden = false;
+    setLevel(0);
+    lvlTimer = setInterval(() => {
+      an.getByteTimeDomainData(buf);
+      let sum = 0;
+      for (let i = 0; i < buf.length; i++) { const v = (buf[i] - 128) / 128; sum += v * v; }
+      const rms = Math.sqrt(sum / buf.length);
+      setLevel(rms);
+      if (rms > 0.02) { heardSpeech = true; silentMs = 0; }
+      else if (heardSpeech) {
+        silentMs += 100;
+        if (silentMs >= 8000) { try { rec.stop(); } catch (_) {} }
+      }
+    }, 100);
+  } catch (_) { /* no meter on this browser — recording still works */ }
+
+  const stopMeter = () => {
+    if (lvlTimer) clearInterval(lvlTimer);
+    lvlTimer = null;
+    setLevel(0);
+    if (actx) { try { actx.close(); } catch (_) {} actx = null; }
+  };
+
+  let timer = null; // assigned below; onstop may fire only after that
   const done = new Promise((resolve, reject) => {
     rec.onstop = async () => {
       clearTimeout(timer);
+      stopMeter();
       stream.getTracks().forEach(t => t.stop());
       if (activeRec && activeRec.rec === rec) activeRec = null;
+      const stopAt = performance.now();
       try {
-        const res = await fetch('/api/stt', {
-          method: 'POST', headers: { 'Content-Type': 'audio/wav' }, credentials: 'include',
-          body: await toWav(new Blob(chunks)),
-        });
-        const x = await res.text();
-        if (res.status === 401) { markSessionExpired(); goLogin(); reject(new Error('సెషన్ ముగిసింది')); return; }
-        let j = {}; try { j = JSON.parse(x); } catch (_) {}
-        if (!j.transcript) { reject(new Error('వినపడలేదు, మళ్లీ చెప్పండి')); return; }
-        resolve(String(j.transcript));
+        // BUG 1(d): trim silence; a clip under 0.6 s never reaches the network
+        const out = await toWav(new Blob(chunks));
+        markTiming('wav', performance.now() - stopAt);
+        if (!(out.seconds >= 0.6)) {
+          reject(new Error('ఇంకొంచెం పొడవుగా చెప్పండి · please say a little longer'));
+          return;
+        }
+        const j = await sttRequest(out.buffer, null, 'stt');
+        let tr = j && typeof j.transcript === 'string' ? j.transcript.trim() : '';
+        if (!tr) {
+          // BUG 1(a): one automatic retry with indic-auto on the SAME audio
+          const j2 = await sttRequest(out.buffer, 'indic-auto', 'stt-retry');
+          tr = j2 && typeof j2.transcript === 'string' ? j2.transcript.trim() : '';
+        }
+        if (!tr) { reject(new Error('వినపడలేదు, మళ్లీ చెప్పండి')); return; }
+        resolve(String(tr));
       } catch (e) {
         // never surface a raw fetch error to the screen
-        if (e && e.message === 'సెషన్ ముగిసింది') return reject(e);
+        if (e && (e.message === 'సెషన్ ముగిసింది' || e.message === 'ఇంకొంచెం పొడవుగా చెప్పండి · please say a little longer')) return reject(e);
+        if (e && e.status === 401) { markSessionExpired(); goLogin(); return reject(new Error('సెషన్ ముగిసింది')); }
         reject(new Error((typeof navigator !== 'undefined' && navigator.onLine === false)
           ? 'ఇంటర్నెట్ లేదు — కనెక్షన్ తనిఖీ చేయండి · you are offline'
           : 'ఇంటర్నెట్ సమస్య, మళ్లీ ప్రయత్నించండి'));
       }
     };
   });
-  const timer = setTimeout(() => { try { rec.stop(); } catch (_) {} }, 20000);
+  timer = setTimeout(() => { try { rec.stop(); } catch (_) {} }, 20000);
   rec.start();
   activeRec = { rec, stop() { try { rec.stop(); } catch (_) {} }, done };
   return activeRec;
+}
+// level meter: 10 class-driven segments (no inline styles, CSP-safe)
+function setLevel(rms) {
+  const el = $('#lvl');
+  if (!el) return;
+  const n = Math.max(0, Math.min(10, Math.round((Number(rms) || 0) * 35)));
+  const bars = el.children;
+  for (let i = 0; i < bars.length; i++) bars[i].classList.toggle('on', i < n);
+}
+// BUG 1: STT with the language in the request and the shop's names as the
+// documented Gnani keyterms (base64url JSON header keeps the audio body raw)
+function sttTerms() {
+  const out = [];
+  const push = s => {
+    const t = String(s == null ? '' : s).trim().slice(0, 60);
+    if (t && out.indexOf(t) === -1 && out.length < 200) out.push(t);
+  };
+  for (const c of (state.customers || [])) push(c && (c.name || c.label));
+  for (const f of (state.rythuFarmers || [])) push(f && f.name);
+  ['ఉద్దెర', 'జమ', 'బాకీ', 'అడ్వాన్స్', 'కమీషన్', 'హమాలి', 'రవాణా', 'తరుగు',
+    'క్వింటా', 'కిలో', 'టన్ను', 'బస్తా', 'వరి', 'పత్తి', 'పసుపు', 'మిరప',
+    'మొక్కజొన్న', 'శనగ', 'బంగాళదుంప', 'టమాటా', 'ఉల్లిపాయ', 'వేరుశనగ',
+    'udhaar', 'jama', 'advance', 'commission', 'quintal', 'kg'].forEach(push);
+  return out;
+}
+async function sttRequest(wavBuf, lang, timingKey) {
+  const headers = { 'Content-Type': 'audio/wav' };
+  try {
+    const terms = sttTerms();
+    if (terms.length) {
+      const bytes = new TextEncoder().encode(JSON.stringify(terms));
+      let bin = '';
+      for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+      headers['X-KV-Terms'] = btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    }
+  } catch (_) { /* terms are a hint only */ }
+  const url = '/api/stt' + (lang ? '?lang=' + encodeURIComponent(lang) : '');
+  const t0 = performance.now();
+  const res = await fetch(url, { method: 'POST', headers, credentials: 'include', body: wavBuf });
+  const x = await res.text();
+  markTiming(timingKey || 'stt', performance.now() - t0);
+  if (res.status === 401) { markSessionExpired(); goLogin(); throw new Error('సెషన్ ముగిసింది'); }
+  if (!res.ok) { const e = new Error('stt_' + res.status); e.status = res.status; throw e; }
+  let j = {};
+  try { j = JSON.parse(x); } catch (_) {}
+  return j || {};
 }
 async function toggleMic() {
   if (activeRec) { activeRec.stop(); return; }   // the awaiting call below finishes the job
@@ -1137,7 +1366,6 @@ async function handleTranscript(raw) {
 }
 
 // ================= single-entry flow (resolver aware) =================
-let pending = null;   // { kind:'single'|'new'|'fuzzy'|'batch', ... }
 
 async function startEntryFlow(entry) {
   const r = resolve(entry.name, state.customers);
@@ -1214,7 +1442,11 @@ function renderConfirmCard() {
     ${limitWarn || ''}
     ${missing.length ? `<div class="missing-note">అవసరం · needed: ${esc(missing.map(m => MISSING_LABELS[m] || m).join(', '))}</div>` : ''}
     <label class="field" for="cfTx">నేను విన్నది · I heard (editable)</label>
-    <input id="cfTx" class="input" value="${esc(e.raw || '')}">
+    <div class="heard-row">
+      <input id="cfTx" class="input heard-in" value="${esc(e.raw || '')}">
+      <button id="cfRe" class="chip-btn heard-re" type="button"
+        aria-label="మళ్లీ పార్స్ · re-parse">↻</button>
+    </div>
     <p class="q-sub">సరిగ్గా ఉందా? · Is this right?</p>
     <div class="confirm-actions">
       <button id="yes" class="btn primary" type="button"${p.ready ? '' : ' disabled'}>✅ అవును</button>
@@ -1228,6 +1460,9 @@ function renderConfirmCard() {
   $('#other').onclick = () => askNewCustomer(e);
   $('#cfType').onclick = () => { e.type = e.type === 'credit' ? 'pay' : 'credit'; renderConfirmCard(); };
   wirePayChips('#cfPayMode', e);
+  // BUG 1: re-parse one corrected word without re-recording
+  const reparse = () => { const i = $('#cfTx'); if (i) runPropose(i.value); };
+  const cfRe = $('#cfRe'); if (cfRe) cfRe.onclick = reparse;
   const amtIn = $('#cfAmt'), txIn = $('#cfTx'), flip = $('.bal-flip', el);
   amtIn.addEventListener('input', () => {
     const a = Math.round(Number(amtIn.value));
@@ -1267,9 +1502,11 @@ async function runPropose(transcript) {
   if (!p || p.kind !== 'single') return;
   const seq = ++p.proposeSeq;
   try {
+    const t0 = performance.now();
     const v = await api('/api/voice/propose', {
       method: 'POST', body: { transcript: String(transcript || '').trim() || p.entry.name },
     });
+    markTiming('propose', performance.now() - t0);
     if (pending !== p || seq !== p.proposeSeq) return; // superseded by a newer edit
     p.preview = v;
     const first = v.candidate && v.candidate[0];
@@ -1540,6 +1777,8 @@ async function speakBalance(c) {
   });
   return speak(msg);
 }
+// spoken numerals for "top 3" lists, shared by the chooser and reports
+const TEL_NUM = ['ఒకటి', 'రెండు', 'మూడు', 'నాలుగు', 'ఐదు', 'ఆరు', 'ఏడు', 'ఎనిమిది', 'తొమ్మిది', 'పది'];
 async function runQuery(q, raw) {
   try {
     await ensureCustomers();
@@ -1584,7 +1823,6 @@ async function runQuery(q, raw) {
 }
 
 // ================= chooser sheet (many candidates) =================
-const TEL_NUM = ['ఒకటి', 'రెండు', 'మూడు', 'నాలుగు', 'ఐదు', 'ఆరు', 'ఏడు', 'ఎనిమిది', 'తొమ్మిది', 'పది'];
 const NUMWORD = {
   'ఒకటి': 1, 'ఒక': 1, 'రెండు': 2, 'మూడు': 3, 'నాలుగు': 4, 'ఐదు': 5,
   'ఆరు': 6, 'ఏడు': 7, 'ఎనిమిది': 8, 'తొమ్మిది': 9, 'పది': 10,
@@ -1600,6 +1838,22 @@ function numberFrom(text) {
   return null;
 }
 let chooser = null;
+// BUG 3: while a sheet is open the page behind it is scroll-locked and the
+// sheet tracks the visual viewport so the on-screen keyboard can never hide
+// the fields or the sticky action bar.
+let sheetVvHandler = null;
+function sheetTrackViewport() {
+  const vv = window.visualViewport;
+  if (!vv) return;
+  const upd = () => {
+    const kb = (window.innerHeight - vv.height) > 120; // keyboard is up
+    document.body.classList.toggle('vv-short', kb);
+  };
+  sheetVvHandler = upd;
+  vv.addEventListener('resize', upd);
+  vv.addEventListener('scroll', upd);
+  upd();
+}
 function showSheet(html) {
   hideSheet();
   const bd = document.createElement('div');
@@ -1609,13 +1863,23 @@ function showSheet(html) {
   sh.innerHTML = html;
   document.body.appendChild(bd);
   document.body.appendChild(sh);
+  document.body.classList.add('sheet-open');
+  sheetTrackViewport();
   bd.onclick = closeChooser;
   return sh;
 }
 function hideSheet() {
+  cancelAudio(); // BUG 4: closing a sheet always silences its prompt
   const bd = document.getElementById('sheetBd'), sh = document.getElementById('sheet');
   if (bd) bd.remove();
   if (sh) sh.remove();
+  document.body.classList.remove('sheet-open', 'vv-short');
+  const vv = window.visualViewport;
+  if (vv && sheetVvHandler) {
+    vv.removeEventListener('resize', sheetVvHandler);
+    vv.removeEventListener('scroll', sheetVvHandler);
+  }
+  sheetVvHandler = null;
 }
 function closeChooser() { chooser = null; hideSheet(); }
 function openChooser(candidates, spoken, mode, entry) {
@@ -1764,6 +2028,7 @@ async function viewHome() {
       : `<div class="hero" id="strip">${skelRows(1)}</div>`}
     <div id="heard" class="heard" hidden></div>
     <div id="say">నొక్కి మాట్లాడండి · Tap and speak</div>
+    <div class="lvl" id="lvl" aria-hidden="true" hidden><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
     <div id="panel"></div>
     <button id="tsBtn" class="btn ts-btn" type="button" aria-label="ఈ రోజు సారాంశం · Today's summary">${ico('chart')} ఈ రోజు సారాంశం · Today's summary</button>
     ${ry ? '' : `<h2 class="section">ఇటీవలి నమోదులు · Last 5 entries</h2>
@@ -2094,6 +2359,18 @@ async function viewPrintCustomer(id, q) {
     location.hash = '#/print/customer/' + id + (p.length ? '?' + p.join('&') : '');
   };
 }
+// produce + deduction display names, shared by the slip/statement text builders
+// (defined before them so no renderer ever reads a const in its TDZ)
+const PROD_UI = [
+  ['వరి', 'paddy'], ['పత్తి', 'cotton'], ['మిరప', 'chilli'], ['మొక్కజొన్న', 'maize'],
+  ['శనగ', 'bengal_gram'], ['కంది', 'red_gram'], ['పెసర', 'green_gram'],
+  ['మినుము', 'black_gram'], ['వేరుశనగ', 'groundnut'], ['పసుపు', 'turmeric'],
+  ['నువ్వులు', 'sesame'], ['జొన్న', 'jowar'],
+];
+const PROD_TE = {};
+for (const [te, en] of PROD_UI) PROD_TE[en] = te;
+const RY_CAT_UI = [['హమాలీ', 'hamali'], ['కమీషన్', 'commission'], ['రవాణా', 'transport'], ['తరుగు', 'tharugu'], ['ఇతర', 'other']];
+const RY_CAT_TE = { hamali: 'హమాలీ', commission: 'కమీషన్', transport: 'రవాణా', tharugu: 'తరుగు', other: 'ఇతర' };
 function statementWaText(s, c, d) {
   const L = [];
   L.push((s.shop_name || 'Khata Vani') + (s.address ? ', ' + s.address : ''));
@@ -2202,6 +2479,9 @@ function renderMergeList(c) {
     };
   });
 }
+// which credits can carry an acknowledgement link (used by the timeline)
+const ACKABLE_EVENT = t => t.type === 'credit' &&
+  (t.event === 'goods_credit' || t.event === 'produce_delivery');
 async function loadTimeline(id) {
   const el = $('#timeline');
   const r = await api('/api/customers/' + id + '/transactions');
@@ -2302,20 +2582,10 @@ async function loadTimeline(id) {
 // direction='payable' rows — the shop OWES the farmer until the delivery is
 // settled in cash. The server is the only authority on amounts for deliveries
 // (qty × rate, integer paise); this file only previews.
-const PROD_UI = [
-  ['వరి', 'paddy'], ['పత్తి', 'cotton'], ['మిరప', 'chilli'], ['మొక్కజొన్న', 'maize'],
-  ['శనగ', 'bengal_gram'], ['కంది', 'red_gram'], ['పెసర', 'green_gram'],
-  ['మినుము', 'black_gram'], ['వేరుశనగ', 'groundnut'], ['పసుపు', 'turmeric'],
-  ['నువ్వులు', 'sesame'], ['జొన్న', 'jowar'],
-];
-const PROD_TE = {};
-for (const [te, en] of PROD_UI) PROD_TE[en] = te;
 const RY_UNIT_UI = [['క్వింటా', 'quintal'], ['కిలో', 'kg'], ['టన్ను', 'tonne'], ['బస్తా', 'bag']];
 // the parser emits its own spellings; canonicalise to what tokenizes money-ready
 const RY_UNIT_CANON = { quintal: 'quintal', kg: 'kg', kilo: 'kg', ton: 'tonne', tonnes: 'tonne', bag: 'bag', bags: 'bag' };
 const RY_KG = { kg: 1, quintal: 100, tonne: 1000 };
-const RY_CAT_UI = [['హమాలీ', 'hamali'], ['కమీషన్', 'commission'], ['రవాణా', 'transport'], ['తరుగు', 'tharugu'], ['ఇతర', 'other']];
-const RY_CAT_TE = { hamali: 'హమాలీ', commission: 'కమీషన్', transport: 'రవాణా', tharugu: 'తరుగు', other: 'ఇతర' };
 const RY_EVENT_TE = { delivery: 'సరుకు · Delivery', advance: 'అడ్వాన్స్', deduction: 'తగ్గింపు', payment: 'చెల్లింపు' };
 const RY_EVENT_TAG = { delivery: 'సరుకు', advance: 'అడ్వాన్స్', deduction: 'తగ్గింపు', payment: 'చెల్లింపు' };
 const RY_MISS_TE = {
@@ -3032,6 +3302,7 @@ function commissionOffer(farmerId, deliveryId, farmerName, gross, quantity, unit
   if (!el) return;
   const pct = state.shop && state.shop.commission_percent != null ? Number(state.shop.commission_percent) : null;
   if (!(gross > 0)) return;
+  let modeVal = 'pct';
   const calc = flat => {
     if (!isFinite(Number(flat)) || !(Number(flat) > 0)) return 0;
     const val = mode() === 'pct' ? gross * Number(flat) / 100
@@ -3041,7 +3312,6 @@ function commissionOffer(farmerId, deliveryId, farmerName, gross, quantity, unit
   };
   const def = mode() === 'pct' ? (pct || 0) : mode() === 'unit' ? '' : (pct ? calc(pct) : '');
   const modes = { flat: 'స్థిర ₹ · Flat', pct: 'గ్రాస్ % · % of gross', unit: 'యూనిట్₹ × పరిమాణం · per unit' };
-  let modeVal = 'pct';
   function mode() { return modeVal; }
   el.innerHTML = `
   <div class="card">
@@ -3392,7 +3662,7 @@ async function viewRythuFarmer(id) {
         };
       });
     },
-    async cash(event, cat) {
+    async cash(e, event, cat) {
       const open = await ryOpenSettlements(id);
       e.hidden = false;
       const qfPay = { payment_mode: 'cash' };
@@ -3483,8 +3753,8 @@ async function viewRythuFarmer(id) {
     b.onclick = async () => {
       const e = $('#ryForm');
       if (b.dataset.act === 'delivery') return forms.delivery(e);
-      if (b.dataset.act === 'deduction') return forms.cash('deduction', 'hamali');
-      return forms.cash(b.dataset.act, null);
+      if (b.dataset.act === 'deduction') return forms.cash(e, 'deduction', 'hamali');
+      return forms.cash(e, b.dataset.act, null);
     };
   });
   function renderRythuSettlements(dd) {
@@ -3623,7 +3893,6 @@ function ryReverseCard(txId, onDone) {
 }
 
 // ================= Sprint 3: acknowledgement UI (shared helpers) =================
-const ACK_FOOTNOTE = '<p class="ack-foot">📨 link ద్వారా ధృవీకరణ · not legal proof</p>';
 // shared entry-summary fragment for the WhatsApp share text
 function ackEntrySummary(e) {
   if (e.event === 'produce_delivery') {
@@ -3659,7 +3928,7 @@ function showAckSheet(link, entry, person) {
     </div>
     <div class="qr-wrap">${link.qrSvg}</div>
     <div class="ack-link-line"><span class="ack-url" id="ackUrlTxt">${esc(link.url)}</span></div>
-    <div class="confirm-actions">
+    <div class="sheet-actions">
       <button id="ackCopy" class="btn" type="button">📋 కాపీ · Copy</button>
       <button id="ackWa" class="btn primary" type="button">🟢 WhatsApp లో పంపండి</button>
     </div>
@@ -3728,8 +3997,6 @@ function ackChipHtml(ackStatus, txnId) {
   if (s === 'cancelled') return '<span class="ack-chip cancelled">రద్దు · Cancelled</span>';
   return '';
 }
-const ACKABLE_EVENT = t => t.type === 'credit' &&
-  (t.event === 'goods_credit' || t.event === 'produce_delivery');
 // wires [data-ack-tx] (send link) and [data-ack-resolve] (resolve card) chips —
 // both carry their transaction id in data-resolve-tx style attributes-free data attrs
 function wireAckActions(el, onSend, onResolved) {

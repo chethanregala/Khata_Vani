@@ -98,6 +98,8 @@ function unitOf(tok) {
   for (const [u, re] of Object.entries(EN_UNITS)) if (re.test(w)) return u;
   return null;
 }
+// regex-safe literal (used by the unit suffix matcher below)
+const escapeRe = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 // price-per phrasing: క్వింటాకు, కిలోకు, టన్నుకు…
 function unitSuffixTok(tok) {
   const w = String(tok || '').toLowerCase();
@@ -111,7 +113,6 @@ function unitSuffixTok(tok) {
   }
   return null;
 }
-const escapeRe = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 // ----------------------------------------------------------- main entry ----
 function parseRythu(raw) {

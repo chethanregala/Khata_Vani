@@ -547,6 +547,74 @@ function stepFail(name, status) {
     ok('kirana shop cannot read a rythu slip (403)', slipNoAuth.status === 403, slipNoAuth.status);
     cookie = cookieB; // back to shop B for the cross-shop isolation steps below
 
+    // ---- 18d. FINAL-FIX REGRESSION: the voice-row taxonomy exactly as the
+    // browser posts it — EVENT-OMITTED rows (the BUG 2 shape: an '' event used
+    // to violate transactions_event_chk -> 500), every strict payment_mode,
+    // and the rythu excess-as-advance split. Fails loudly on any non-2xx.
+    {
+      const idem = () => crypto.randomUUID();
+      // voice rows omit event entirely (saveEntries sends no event field)
+      const vc = await reqJSON('voice-noevent-credit', 'POST', '/api/transactions', {
+        customer_id: oid, workflow: 'kirana', type: 'credit', amount: 7,
+        payment_mode: 'cash', raw_transcript: '', idempotency_key: idem(), source: 'voice',
+      });
+      ok('BUG2 regression: voice credit row with NO event posts (server defaults it)', vc.res.ok);
+      const vp = await reqJSON('voice-noevent-repay', 'POST', '/api/transactions', {
+        customer_id: oid, workflow: 'kirana', type: 'pay', amount: 2,
+        payment_mode: 'cash', raw_transcript: '', idempotency_key: idem(), source: 'voice',
+      });
+      ok('BUG2 regression: voice repayment with NO event posts', vp.res.ok);
+      // strict payment_mode values: cash/upi/bank/other
+      const modes = [];
+      for (const m of ['cash', 'upi', 'bank', 'other']) {
+        const pm = await reqJSON('voice-mode-' + m, 'POST', '/api/transactions', {
+          customer_id: oid, workflow: 'kirana', type: 'pay', event: 'repayment', amount: 1,
+          payment_mode: m, raw_transcript: 'm', idempotency_key: idem(), source: 'voice',
+        });
+        ok('payment_mode ' + m + ' posts on the real DB', pm.res.ok &&
+          pm.data && pm.data.payment_mode === m, pm.res.status);
+        if (pm.res.ok) modes.push(m);
+      }
+      ok('all four payment_mode values accepted', modes.length === 4);
+    }
+    // rythu excess-as-advance (allow_advance) on shop A's open settlement
+    cookie = cookieA;
+    {
+      const slipA = await reqJSON('adv-slip-read', 'GET', '/api/statements/settlement/' + d.id);
+      if (!slipA.res.ok) throw slipA.out;
+      const rem = Number(slipA.data && slipA.data.remaining) || 0;
+      if (rem > 0) {
+        const noOver = await reqJSON('adv-excess-no-flag', 'POST', '/api/transactions', {
+          customer_id: farmerId, workflow: 'rythu', type: 'pay', event: 'payment',
+          amount: rem + 100, settlement_id: d.id, payment_mode: 'cash',
+          idempotency_key: crypto.randomUUID(), source: 'screen',
+        });
+        ok('excess payment WITHOUT allow_advance refused (409)',
+          !noOver.res.ok && noOver.res.status === 409, noOver.res.status);
+        const withFlag = await reqJSON('adv-excess-with-flag', 'POST', '/api/transactions', {
+          customer_id: farmerId, workflow: 'rythu', type: 'pay', event: 'payment',
+          amount: rem + 100, settlement_id: d.id, payment_mode: 'cash',
+          allow_advance: true, idempotency_key: crypto.randomUUID(), source: 'screen',
+        });
+        ok('excess payment WITH allow_advance posts (splits into payment + advance)',
+          withFlag.res.ok, withFlag.res.status);
+        const slipB = await reqJSON('adv-slip-after', 'GET', '/api/statements/settlement/' + d.id);
+        // the excess becomes an UNALLOCATED advance (settlement_id null), so the
+        // settlement closes at 0 while its own advance_total stays unchanged
+        const stmtA2 = await fetch(BASE + '/api/statements/customer/' + farmerId, { headers: { Cookie: cookie } });
+        const rowsA2 = stmtA2.ok ? ((await stmtA2.json()).transactions || []) : [];
+        const unalloc = rowsA2.find(t => t.event === 'advance' && t.settlement_id == null &&
+          Math.round(Number(t.amount) * 100) === 10000);
+        ok('after the split: settlement remaining 0, excess parked as an unallocated advance',
+          slipB.res.ok && slipB.data && slipB.data.remaining === 0 &&
+          slipB.data.advance_total === slipA.data.advance_total && !!unalloc,
+          slipB.res.ok ? '' : slipB.res.status);
+      } else {
+        ok('settlement already closed — excess-as-advance probe skipped (remaining=0)', true);
+      }
+    }
+    cookie = cookieB; // back to shop B for cleanup bookkeeping symmetry
+
     console.log('\n[smoke] EVERY STEP PASSED — rythu save works against the real server');
   } catch (e) {
     console.log('[smoke] STOPPED at the failing step (status/code above). Cleanup still runs.');

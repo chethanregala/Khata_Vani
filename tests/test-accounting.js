@@ -66,7 +66,9 @@ function fakeSb() {
     };
     return b;
   };
+  let lastRpc = null; // BUG 2 regression: the exact args of the last RPC call
   const rpc = (name, args) => {
+    lastRpc = args; // capture for BUG 2 regression (what actually reaches the RPC)
     if (name !== 'post_transactions') throw new Error('unknown rpc ' + name);
     const { p_shop_id: shop, p_rows: rows } = args;
     if (!Array.isArray(rows) || !rows.length) throw { message: 'BAD_ROWS' };
@@ -118,6 +120,7 @@ function fakeSb() {
     from: tbl => chain(tbl, { tbl, filters: [], b: {} }),
     rpc,
     _db: db, _setCustomer: c => db.customers.push(c), _setTx: t => db.transactions.push(t),
+    get _lastRpcArgs() { return lastRpc; },
   };
 }
 
@@ -361,6 +364,21 @@ const fresh = () => {
     ok('cross-shop isolation: other shop exports zero of this shop', ex2.count === 0 &&
       ex2.csv.indexOf('రాము') === -1);
     await errCodeAsync(ledger.transactionsExport(SHOP, '2026-1-1', null), 'BAD_REQUEST');
+  }
+
+  // ------------------------------------------------------------------
+  // 8. BUG 2 regression: event-OMITTED voice rows reach the RPC with a
+  //    real null event — '' (empty string) is NOT null, so the database
+  //    default COALESCE never fired and transactions_event_chk broke (23514).
+  // ------------------------------------------------------------------
+  {
+    const sb = fresh();
+    await ledger.postTransactions(SHOP, {
+      customer_id: K, type: 'credit', amount: '10', payment_mode: 'cash', raw_transcript: '',
+    });
+    const sent = sb._lastRpcArgs && sb._lastRpcArgs.p_rows && sb._lastRpcArgs.p_rows[0];
+    ok('BUG2: omitted event posts a real null to the RPC (never empty string)',
+      !!sent && sent.event === null, 'event=' + JSON.stringify(sent ? sent.event : 'NO-ARGS'));
   }
 
   console.log(`\n[accounting] ${checks} checks passed`);
