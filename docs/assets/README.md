@@ -1,30 +1,25 @@
-# README assets — replacement guide
+# README assets
 
-Every file in this folder is a **neutral grey placeholder** that says `Add: <filename>`.
-Replace each one with the real image, keeping the **exact filename** so the README
-keeps working. No code changes are needed after replacement.
+These are the real logos and app screenshots supplied by the author, wired
+directly into the root `README.md`. Keep the filenames unchanged when updating
+an image.
 
-| File | Ideal size | Used for |
+| File | Size | Used for |
 |---|---|---|
-| `logo-khata-vani.png` | 512×512, transparent background | Centered header logo in `README.md` |
-| `gnani-logo.png` | 512×512, transparent background | "Built for" row (Gnani AI attribution) |
-| `challenge-badge.png` | 512×512, transparent background | "Built for" row (Great Indian AI Internship Challenge badge) |
-| `screenshot-01-login-voice-check.png` | 390×844 (phone capture) | Login + spoken word check |
-| `screenshot-02-business-type.png` | 390×844 (phone capture) | Business-type choice (Kirana / Rythu) |
-| `screenshot-03-kirana-home.png` | 390×844 (phone capture) | Kirana home |
-| `screenshot-04-kirana-voice-confirm.png` | 390×844 (phone capture) | Voice entry confirmation card |
-| `screenshot-05-customer-statement.png` | 390×844 (phone capture) | Customer statement |
-| `screenshot-06-rythu-home.png` | 390×844 (phone capture) | Rythu home |
-| `screenshot-07-rythu-settlement.png` | 390×844 (phone capture) | Rythu settlement |
-| `screenshot-08-settlement-slip.png` | 390×844 (phone capture) | Printable settlement slip |
-| `screenshot-09-acknowledgement-link.png` | 390×844 (phone capture) | Customer acknowledgement page |
-| `screenshot-10-dashboard.png` | 390×844 (phone capture) | Dashboard |
-| `demo-thumbnail.png` | 1280×720 (16:9) | Demo video thumbnail |
+| `logo-khata-vani.png` | 606×786 | Centered header logo in `README.md` |
+| `gnani-logo.png` | 447×447 | "Built for" row (Gnani AI attribution) |
+| `challenge-badge.png` | 596×335 | "Built for" row (Great Indian AI Internship Challenge badge) |
+| `screenshot-01-login.png` | 802×895 | Login / phone number screen |
+| `screenshot-02-rythu-home.png` | 745×1009 | Rythu home (payable summary, farmer list) |
+| `screenshot-03-rythu-farmers.png` | 735×996 | Farmers list with open settlement counts |
+| `screenshot-04-farmer-settlements.png` | 748×1009 | Farmer account, actions and settlements |
+| `screenshot-05-dashboard.png` | 733×1000 | Dashboard (payable, advances, acknowledgements, top 5) |
+| `screenshot-06-settings.png` | 739×997 | Shop profile and commission settings |
+| `screenshot-07-settings-export.png` | 709×993 | Commission default, CSV export and business type |
 
 Notes:
 
-- Logos should be PNG with a transparent background and the owner's original colours.
-- Phone captures: 390×844 is the iPhone 12/13/14 logical viewport; use a real
-  device or devtools at that size, no browser chrome.
-- Keep file sizes reasonable (screenshots usually < 300 KB each).
-- The placeholder images were generated without adding any dependency to the project.
+- The screenshots are phone captures; keep the portrait ratio when replacing them.
+- Logos belong to their respective owners and are used only for attribution.
+- Older placeholder images and the demo thumbnail were removed; the demo video is
+  linked directly from `README.md`.

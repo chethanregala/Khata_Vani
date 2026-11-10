@@ -1,31 +1,13 @@
 <!--
   ============================================================================
-  TODO — REPLACE BEFORE SUBMISSION
+  TODO — FINAL ITEMS
   ============================================================================
-  1. LIVE_APP_URL              — public Render URL of the live app
-  2. DEMO_VIDEO_URL            — demo video link (YouTube / Drive / Loom)
-  3. LINKEDIN_POST_URL         — LinkedIn post about this project
-  4. X_POST_URL                — X (Twitter) post about this project
-  5. PITCH.md                  — replace the TODO stub with the real one-page pitch
-  6. AUTHOR_LINKEDIN_URL       — author's LinkedIn profile URL
-  7. AUTHOR_X_URL              — author's X profile URL
-  8. docs/assets/logo-khata-vani.png          — real project logo
-  9. docs/assets/gnani-logo.png               — Gnani AI logo
- 10. docs/assets/challenge-badge.png          — challenge badge
- 11. docs/assets/screenshot-01-login-voice-check.png
- 12. docs/assets/screenshot-02-business-type.png
- 13. docs/assets/screenshot-03-kirana-home.png
- 14. docs/assets/screenshot-04-kirana-voice-confirm.png
- 15. docs/assets/screenshot-05-customer-statement.png
- 16. docs/assets/screenshot-06-rythu-home.png
- 17. docs/assets/screenshot-07-rythu-settlement.png
- 18. docs/assets/screenshot-08-settlement-slip.png
- 19. docs/assets/screenshot-09-acknowledgement-link.png
- 20. docs/assets/screenshot-10-dashboard.png
- 21. docs/assets/demo-thumbnail.png
+  1. AUTHOR_LINKEDIN_URL — author's LinkedIn profile URL (Author section)
+  2. AUTHOR_X_URL        — author's X profile URL (Author section)
+  3. <repo-url>          — public repository URL (Getting started)
 
-  All images above are grey placeholders. Keep the exact filenames when you
-  replace them. See docs/assets/README.md for sizes and usage.
+  Logos and screenshots are the real assets supplied by the author and live in
+  docs/assets/. See docs/assets/README.md for what each image shows.
   ============================================================================
 -->
 
@@ -38,14 +20,12 @@
 <p align="center"><em>Speak your ledger</em></p>
 
 <p align="center">
-  <a href="LIVE_APP_URL"><img src="https://img.shields.io/badge/live-demo-0a7d4b?style=flat-square" alt="Live demo"></a>
-  <a href="DEMO_VIDEO_URL"><img src="https://img.shields.io/badge/demo-video-b3261e?style=flat-square" alt="Demo video"></a>
+  <a href="https://khata-vani.onrender.com"><img src="https://img.shields.io/badge/live-demo-0a7d4b?style=flat-square" alt="Live demo"></a>
+  <a href="https://drive.google.com/drive/folders/16wPHTQYKHq6VWhGlVpNPKi2bBvQd0Y6s?usp=drive_link"><img src="https://img.shields.io/badge/demo-video-b3261e?style=flat-square" alt="Demo video"></a>
   <img src="https://img.shields.io/badge/node-%3E%3D20-339933?style=flat-square&logo=nodedotjs&logoColor=white" alt="Node >= 20">
   <img src="https://img.shields.io/badge/tests-432%20hermetic%20%2B%2078%20smoke-0a7d4b?style=flat-square" alt="Tests">
   <img src="https://img.shields.io/badge/built%20with-Gnani%20AI-6d28d9?style=flat-square" alt="Built with Gnani AI">
 </p>
-
-<!-- TODO: LIVE_APP_URL and DEMO_VIDEO_URL are links to be replaced. -->
 
 Khata Vani is a voice-first ledger for small Indian businesses: the shopkeeper speaks a
 transaction in Telugu, the app shows a confirmation card, and only then writes the entry
@@ -68,12 +48,10 @@ installing an app or logging in.
 
 | Resource | Link |
 |---|---|
-| Live app | [LIVE_APP_URL](LIVE_APP_URL) |
-| Demo video | [DEMO_VIDEO_URL](DEMO_VIDEO_URL) |
+| Live app | [khata-vani.onrender.com](https://khata-vani.onrender.com) |
+| Demo video | [Google Drive demo folder](https://drive.google.com/drive/folders/16wPHTQYKHq6VWhGlVpNPKi2bBvQd0Y6s?usp=drive_link) |
 | One-page pitch | [PITCH.md](./PITCH.md) |
-| LinkedIn post | [LINKEDIN_POST_URL](LINKEDIN_POST_URL) |
-| X post | [X_POST_URL](X_POST_URL) |
-| Demo logins (fake data) | [Jump to demo logins](#demo-logins) |
+| LinkedIn post | [LinkedIn post](https://lnkd.in/p/dPt4PyEp) |
 
 ## The problem
 
@@ -96,16 +74,10 @@ focused products:
 
 | | |
 |---|---|
-| <img src="docs/assets/screenshot-01-login-voice-check.png" alt="Login with spoken word check" width="260"><br>**01 — Login + spoken word check.** Phone, a word played by Timbre TTS, then the PIN. | <img src="docs/assets/screenshot-02-business-type.png" alt="Business type choice" width="260"><br>**02 — Choose the business type.** Kirana or Rythu, chosen once at sign-up. |
-| <img src="docs/assets/screenshot-03-kirana-home.png" alt="Kirana home" width="260"><br>**03 — Kirana home.** Customers, balances and the floating mic. | <img src="docs/assets/screenshot-04-kirana-voice-confirm.png" alt="Voice confirmation card" width="260"><br>**04 — Voice confirmation.** Parsed entry read back before saving. |
-| <img src="docs/assets/screenshot-05-customer-statement.png" alt="Customer statement" width="260"><br>**05 — Customer statement.** Opening balance, running balance and date window. | <img src="docs/assets/screenshot-06-rythu-home.png" alt="Rythu home" width="260"><br>**06 — Rythu home.** Farmers, payables and today's settlement strip. |
-| <img src="docs/assets/screenshot-07-rythu-settlement.png" alt="Rythu settlement" width="260"><br>**07 — Rythu settlement.** Delivery anchor, advances, deductions and payments. | <img src="docs/assets/screenshot-08-settlement-slip.png" alt="Settlement slip" width="260"><br>**08 — Settlement slip.** Itemised slip with payment and remaining balance. |
-| <img src="docs/assets/screenshot-09-acknowledgement-link.png" alt="Acknowledgement page" width="260"><br>**09 — Customer acknowledgement.** Public `/a/<token>` page with QR and audio. | <img src="docs/assets/screenshot-10-dashboard.png" alt="Dashboard" width="260"><br>**10 — Dashboard.** Receivable/payable, today's entries, acknowledgements, top 5. |
-
-<p align="center">
-  <a href="DEMO_VIDEO_URL"><img src="docs/assets/demo-thumbnail.png" alt="Demo video thumbnail" width="560"></a>
-  <br><em>Demo video thumbnail — TODO: replace and link DEMO_VIDEO_URL.</em>
-</p>
+| <img src="docs/assets/screenshot-01-login.png" alt="Login screen" width="260"><br>**01 — Login.** Phone number entry; the spoken-word check and PIN follow. | <img src="docs/assets/screenshot-02-rythu-home.png" alt="Rythu home" width="260"><br>**02 — Rythu home.** Total payable, advances, payments and the farmer list. |
+| <img src="docs/assets/screenshot-03-rythu-farmers.png" alt="Farmers list" width="260"><br>**03 — Farmers.** Farmer accounts with their open settlement count. | <img src="docs/assets/screenshot-04-farmer-settlements.png" alt="Farmer account and settlements" width="260"><br>**04 — Farmer account.** Advances, entry actions and the settlement list. |
+| <img src="docs/assets/screenshot-05-dashboard.png" alt="Dashboard" width="260"><br>**05 — Dashboard.** Payable, advances to recover, today's entries, acknowledgements, top 5. | <img src="docs/assets/screenshot-06-settings.png" alt="Settings" width="260"><br>**06 — Settings.** Shop profile and commission defaults. |
+| <img src="docs/assets/screenshot-07-settings-export.png" alt="Settings export" width="260"><br>**07 — Settings / export.** Default commission, CSV export with date range, business type. | |
 
 ## Features by workflow
 
@@ -331,7 +303,7 @@ khata-vani/
 ├── docs/
 │   ├── SECURITY.md            Security hardening report
 │   └── assets/                README images (placeholders until replaced)
-├── PITCH.md                   One-page pitch (TODO stub)
+├── PITCH.md                   One-page pitch
 ├── .env.example               Environment variable names and safe defaults
 ├── .gitignore
 ├── eslint.config.js
