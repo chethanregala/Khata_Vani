@@ -1,98 +1,369 @@
-# Khata Vani (ఖాతా వాణి)
+<!--
+  ============================================================================
+  TODO — REPLACE BEFORE SUBMISSION
+  ============================================================================
+  1. LIVE_APP_URL              — public Render URL of the live app
+  2. DEMO_VIDEO_URL            — demo video link (YouTube / Drive / Loom)
+  3. LINKEDIN_POST_URL         — LinkedIn post about this project
+  4. X_POST_URL                — X (Twitter) post about this project
+  5. PITCH.md                  — replace the TODO stub with the real one-page pitch
+  6. AUTHOR_LINKEDIN_URL       — author's LinkedIn profile URL
+  7. AUTHOR_X_URL              — author's X profile URL
+  8. docs/assets/logo-khata-vani.png          — real project logo
+  9. docs/assets/gnani-logo.png               — Gnani AI logo
+ 10. docs/assets/challenge-badge.png          — challenge badge
+ 11. docs/assets/screenshot-01-login-voice-check.png
+ 12. docs/assets/screenshot-02-business-type.png
+ 13. docs/assets/screenshot-03-kirana-home.png
+ 14. docs/assets/screenshot-04-kirana-voice-confirm.png
+ 15. docs/assets/screenshot-05-customer-statement.png
+ 16. docs/assets/screenshot-06-rythu-home.png
+ 17. docs/assets/screenshot-07-rythu-settlement.png
+ 18. docs/assets/screenshot-08-settlement-slip.png
+ 19. docs/assets/screenshot-09-acknowledgement-link.png
+ 20. docs/assets/screenshot-10-dashboard.png
+ 21. docs/assets/demo-thumbnail.png
 
-A voice-first ledger ("khata") app for Indian kirana shops and rythu (farmer/produce) traders. The shopkeeper speaks in Telugu; the app parses the sentence, shows a confirmation card, and posts double-safe ledger entries. Customers get a shareable link (with QR and Telugu audio) to acknowledge or dispute a credit — no app or login needed on their side.
+  All images above are grey placeholders. Keep the exact filenames when you
+  replace them. See docs/assets/README.md for sizes and usage.
+  ============================================================================
+-->
 
-## Workflows
+<p align="center">
+  <img src="docs/assets/logo-khata-vani.png" alt="Khata Vani logo" width="120">
+</p>
 
-- **Kirana**: "రమేష్ 500 ఉద్దెర" → goods credit on the customer's account; "జమ" records a repayment. Overpayments are rejected; reversals write offsetting rows (history is never deleted).
-- **Rythu**: a produce delivery (quantity × rate, server-computed) becomes a settlement anchor; advances, deductions (hamali, commission, transport…) and payments auto-link to it, and the remaining balance is always cash-out exact.
-- **Acknowledgements**: any kirana credit can mint a secret link `/a/<token>` — QR + summary audio for the customer to acknowledge, dispute, or resolve. One active link per entry; re-minting revokes awaiting links; answered links keep their truthful state.
+<h1 align="center">Khata Vani (ఖాతా వాణి)</h1>
 
-## Voice models (Gnani)
+<p align="center"><em>Speak your ledger</em></p>
 
-- **Prisma STT** (`/api/stt` → `prisma-v3.0`): spoken entries, balance queries, and name-choice replies.
-- **Timbre TTS** (`/api/tts`): confirmations, query answers, login word-check words, and acknowledgement-link audio.
+<p align="center">
+  <a href="LIVE_APP_URL"><img src="https://img.shields.io/badge/live-demo-0a7d4b?style=flat-square" alt="Live demo"></a>
+  <a href="DEMO_VIDEO_URL"><img src="https://img.shields.io/badge/demo-video-b3261e?style=flat-square" alt="Demo video"></a>
+  <img src="https://img.shields.io/badge/node-%3E%3D20-339933?style=flat-square&logo=nodedotjs&logoColor=white" alt="Node >= 20">
+  <img src="https://img.shields.io/badge/tests-432%20hermetic%20%2B%2078%20smoke-0a7d4b?style=flat-square" alt="Tests">
+  <img src="https://img.shields.io/badge/built%20with-Gnani%20AI-6d28d9?style=flat-square" alt="Built with Gnani AI">
+</p>
 
-Both are server-side proxies with per-shop rate limits, timeouts, and strict validation. Raw provider payloads are never forwarded or logged.
+<!-- TODO: LIVE_APP_URL and DEMO_VIDEO_URL are links to be replaced. -->
 
-## Setup
+Khata Vani is a voice-first ledger for small Indian businesses: the shopkeeper speaks a
+transaction in Telugu, the app shows a confirmation card, and only then writes the entry
+to a server-side ledger. It serves two focused workflows chosen at sign-up — **Kirana**
+(shop credit and repayments) and **Rythu** (farmer produce settlements) — and lets a
+customer acknowledge a credit through a secret link, with QR and Telugu audio, without
+installing an app or logging in.
 
-```bash
-npm install
-cp .env.example .env      # fill the vars below
-npm start                 # http://localhost:3000
+## Built for
+
+<p align="center">
+  <img src="docs/assets/gnani-logo.png" alt="Gnani AI" width="140">
+  &nbsp;&nbsp;&nbsp;
+  <img src="docs/assets/challenge-badge.png" alt="Great Indian AI Internship Challenge" width="180">
+</p>
+
+<p align="center"><strong>Solo entry by Chethan Regala, B.Tech, Godavari Global University</strong></p>
+
+## Quick links
+
+| Resource | Link |
+|---|---|
+| Live app | [LIVE_APP_URL](LIVE_APP_URL) |
+| Demo video | [DEMO_VIDEO_URL](DEMO_VIDEO_URL) |
+| One-page pitch | [PITCH.md](./PITCH.md) |
+| LinkedIn post | [LINKEDIN_POST_URL](LINKEDIN_POST_URL) |
+| X post | [X_POST_URL](X_POST_URL) |
+| Demo logins (fake data) | [Jump to demo logins](#demo-logins) |
+
+## The problem
+
+Small kirana shops and produce traders still run on a paper *khata*. Writing every
+credit and repayment is slow, balances are easy to get wrong, and a customer has no
+easy way to check or acknowledge what is owed. Typing on a phone in Telugu is awkward
+for many shopkeepers, so software that assumes a keyboard often goes unused.
+
+## The solution
+
+Khata Vani makes **speaking** the primary input. A shopkeeper says the entry, hears or
+reads the confirmation, and taps once to save. The ledger lives in Postgres, not on the
+device, so it survives a lost phone. At sign-up the user picks exactly one of two
+focused products:
+
+- **Kirana** — customer credit, repayments, statements and acknowledgement links.
+- **Rythu** — farmer deliveries, advances, deductions, payments and settlement slips.
+
+## Screenshots
+
+| | |
+|---|---|
+| <img src="docs/assets/screenshot-01-login-voice-check.png" alt="Login with spoken word check" width="260"><br>**01 — Login + spoken word check.** Phone, a word played by Timbre TTS, then the PIN. | <img src="docs/assets/screenshot-02-business-type.png" alt="Business type choice" width="260"><br>**02 — Choose the business type.** Kirana or Rythu, chosen once at sign-up. |
+| <img src="docs/assets/screenshot-03-kirana-home.png" alt="Kirana home" width="260"><br>**03 — Kirana home.** Customers, balances and the floating mic. | <img src="docs/assets/screenshot-04-kirana-voice-confirm.png" alt="Voice confirmation card" width="260"><br>**04 — Voice confirmation.** Parsed entry read back before saving. |
+| <img src="docs/assets/screenshot-05-customer-statement.png" alt="Customer statement" width="260"><br>**05 — Customer statement.** Opening balance, running balance and date window. | <img src="docs/assets/screenshot-06-rythu-home.png" alt="Rythu home" width="260"><br>**06 — Rythu home.** Farmers, payables and today's settlement strip. |
+| <img src="docs/assets/screenshot-07-rythu-settlement.png" alt="Rythu settlement" width="260"><br>**07 — Rythu settlement.** Delivery anchor, advances, deductions and payments. | <img src="docs/assets/screenshot-08-settlement-slip.png" alt="Settlement slip" width="260"><br>**08 — Settlement slip.** Itemised slip with payment and remaining balance. |
+| <img src="docs/assets/screenshot-09-acknowledgement-link.png" alt="Acknowledgement page" width="260"><br>**09 — Customer acknowledgement.** Public `/a/<token>` page with QR and audio. | <img src="docs/assets/screenshot-10-dashboard.png" alt="Dashboard" width="260"><br>**10 — Dashboard.** Receivable/payable, today's entries, acknowledgements, top 5. |
+
+<p align="center">
+  <a href="DEMO_VIDEO_URL"><img src="docs/assets/demo-thumbnail.png" alt="Demo video thumbnail" width="560"></a>
+  <br><em>Demo video thumbnail — TODO: replace and link DEMO_VIDEO_URL.</em>
+</p>
+
+## Features by workflow
+
+### Kirana
+
+- Voice credit entries and repayments, parsed from Telugu (with English fallback) and
+  confirmed on a card before saving.
+- Customer creation with optional opening balance, edit, and merge of duplicate names.
+- Integer-paise money math with Indian digit grouping; no floating-point rupees.
+- Reversals instead of deletes: a mistake is undone by one offsetting row.
+- Per-customer statement with opening balance, running balance and optional date range.
+- CSV export for a date range, with UTF-8 BOM and formula-injection guarding.
+- Discounts, payment modes (cash / UPI / bank / other) and commission categories.
+- Every saved entry carries a client idempotency key, so a retry cannot double-post.
+
+### Rythu
+
+- A produce delivery (quantity × rate, computed on the server) becomes a settlement
+  anchor for that farmer.
+- Advances, deductions (hamali, commission, transport and similar categories) and
+  payments auto-link to the open settlement.
+- Excess payment is refused unless the user explicitly allows it, in which case the
+  excess is parked as an unallocated advance.
+- Settlement read-model with an exact cash-out remaining balance.
+- Itemised, printable settlement slip and farmer statement.
+
+### Trust and acknowledgement
+
+- Any kirana credit can mint a secret `/a/<token>` link with a QR code and Telugu audio.
+- Tokens are stored hashed, expire, and are revocable; one active link per entry.
+- The customer can acknowledge, dispute or resolve — no app and no login.
+- Re-minting a link revokes the awaiting one; answered links keep their truthful state.
+- The UI states plainly that a link acknowledgement is a record, not legal proof.
+
+## How Gnani AI is used
+
+| Feature | Model | Where in the code |
+|---|---|---|
+| Spoken ledger entry, balance query, name-choice reply | **Prisma STT** (`prisma-v3.0`, `indic-auto` default) | `POST /api/stt` in `server.js` |
+| Custom vocabulary for shop and customer names | **Prisma STT** `keyterms` field | `server.js` STT proxy (keyterms builder) |
+| Login word challenge audio | **Timbre TTS** (`timbre-v2.5`, voice `Nalini`, `te-IN`) | `wordAudio()` → `/api/auth/challenge/audio/:challengeId` |
+| Confirmation and answer playback | **Timbre TTS** | `gnaniTts()` → `POST /api/tts` |
+| Acknowledgement-link audio | **Timbre TTS** | `/a/:token/audio` with a token-hash-keyed cache |
+
+All Gnani calls are server-side proxies. The browser never sees the API key, raw
+provider payloads are not forwarded, and per-shop rate limits protect the credits.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  B["Browser SPA<br/>public/index.html + app.js"] -->|"JSON over HTTPS<br/>session cookie"| E["Express<br/>server.js"]
+  B -->|"audio blob"| E
+  E -->|"Prisma STT"| G["Gnani AI<br/>api.vachana.ai"]
+  E -->|"Timbre TTS"| G
+  E -->|"service-role REST"| S[("Supabase Postgres")]
+  C["Customer<br/>/a/&lt;token&gt; page"] -->|"public ack API"| E
 ```
 
-Required env vars (missing/placeholder values are fatal at startup in production, warn in dev; values are never printed):
+**Voice-entry sequence.** The browser records a clip and posts it to `/api/stt`. The
+server proxies it to Prisma, returns only the transcript and parsed proposal, and the
+SPA shows a confirmation card. Confirming posts the entry with an idempotency key; the
+server recomputes the amount, writes the ledger row in Supabase, and responds with the
+saved entry. TTS is a convenience at every step — if audio fails, the text card still
+works.
 
-| Var | Purpose |
+## Engineering highlights
+
+- **Idempotent saves** — `shop_id + idempotency_key` is unique; retries and double-taps
+  cannot create a second transaction.
+- **Reversal instead of delete** — history is append-only; an offsetting row preserves
+  the audit trail.
+- **Integer-paise money math** — all arithmetic is in paise, with explicit conversion at
+  the API boundary and Indian grouping in the UI.
+- **Per-shop isolation** — every query filters `shop_id` from the signed session; client
+  IDs are re-checked against that shop, including public acknowledgement reads.
+- **Security headers and CSP** — strict Content-Security-Policy, `X-Frame-Options: DENY`,
+  `Permissions-Policy`, HSTS in production, same-origin CSRF guard, opaque error handler.
+- **Rate limits** — separate buckets for auth (30 per 15 min), challenge audio (60/min)
+  and per-shop STT/TTS, so one shop or a stranger cannot burn Gnani credits.
+- **Log scrubbing** — secrets, tokens, phone numbers and transcripts are not logged;
+  startup validation refuses weak or placeholder secrets in production.
+- **Automated tests** — **432 hermetic checks across 9 suites** (parser 31, resolver 13,
+  security 109, ledger 50, rythu 86, acknowledgements 52, business type 39, accounting 42,
+  audio 10) plus **78 end-to-end smoke checks** against the real server and database.
+
+## Getting started
+
+### Prerequisites
+
+- Node.js **20 or newer** and npm.
+- A Supabase project (Postgres + service-role key, server-side only).
+- A Gnani AI API key for Prisma STT and Timbre TTS.
+
+### Install
+
+```bash
+git clone <repo-url> khata-vani
+cd khata-vani
+npm install
+cp .env.example .env
+```
+
+Fill `.env` from the table below. Never commit it.
+
+### Environment variables
+
+| Name | Purpose |
 |---|---|
-| `GNANI_API_KEY` | Gnani STT/TTS key |
+| `GNANI_API_KEY` | Gnani AI key for STT and TTS (server-side only) |
+| `STT_LANG` | Default STT language (`indic-auto` in `.env.example`) |
+| `TTS_VOICE` | Timbre voice name (default `Nalini`) |
+| `TTS_LANG` | TTS language (default `te-IN`) |
+| `TTS_MODEL` | TTS model (default `timbre-v2.5`) |
+| `PORT` | HTTP port (default `3000`) |
 | `SUPABASE_URL` | Supabase project URL |
-| `SUPABASE_SERVICE_KEY` | Supabase service-role key (`SUPABASE_SECRET_KEY` also accepted) |
-| `JWT_SECRET` | ≥32 chars, ≥12 distinct, not a placeholder |
-| `APP_ORIGIN` | production only — canonical public origin for ack links |
-| `TRUST_PROXY` | `1` behind a reverse proxy (Render), so rate limits see real IPs |
-| `NODE_ENV` | `production` enables secure cookies, HSTS, strict config checks |
+| `SUPABASE_SERVICE_KEY` | Supabase service-role key; `SUPABASE_SECRET_KEY` is also accepted |
+| `JWT_SECRET` | Long random string used to sign session and challenge tokens |
+| `NODE_ENV` | `production` enables secure cookies, HSTS and strict config checks |
+| `APP_ORIGIN` | Canonical public origin used when building acknowledgement links |
+| `TRUST_PROXY` | Set to `1` behind Render or another trusted proxy, for real client IPs |
+| `KEEPALIVE_TOKEN` | Secret for the `/keepalive` cron endpoint |
+| `TTS_CACHE_DIR` | Optional override for the TTS cache directory |
 
-## npm scripts
+### Database migrations
 
-- `npm start` — run the server
-- `npm test` — hermetic suites: parser, resolver, security, ledger, rythu, acknowledgements
-- `npm run smoke` — end-to-end flow against the real Supabase (server must be running); creates a throwaway shop and cleans up everything
-- `npm run seed` / `npm run seed:clean` — demo data in / out
+Apply the SQL files in `supabase/migrations/` **in filename order** (SQL editor or
+Supabase CLI):
 
-## Deploy (Render)
+```text
+002_ledger_foundation.sql
+003_acknowledgements.sql
+003_fix_post_transactions_cte.sql
+004_business_type.sql
+005_accounting_essentials.sql
+006_fix_post_transactions_payment_mode.sql
+```
 
-- Build: `npm install` · Start: `npm start`
-- Env: `NODE_ENV=production`, `TRUST_PROXY=1`, `APP_ORIGIN=https://<your-domain>`, plus the vars above.
-- Persistent disk for `data/tts-cache` (optional — it regenerates; the server starts fine if it is missing).
+The migrations are additive; existing ledger rows are not rewritten.
 
-## Keep-alive (free-tier cron)
+### Run
 
-Render's free tier sleeps the service; first requests then stall for tens of seconds.
-A 5-minute cron keeps it awake (and keeps the Supabase pool warm):
+```bash
+npm start
+# http://localhost:3000
+```
 
-1. Generate a secret once: `node -e "console.log(require('crypto').randomBytes(24).toString('base64url'))"`
-2. Set it on Render: env var `KEEPALIVE_TOKEN=<that secret>` (never commit it).
-3. Create a cron job on <https://cron-job.org> (free): URL
+### Test
 
-   ```
-   https://<your-render-domain>/keepalive?k=<KEEPALIVE_TOKEN>
-   ```
+```bash
+npm test        # 432 hermetic checks, no network or credits used
+npm run smoke   # 78 end-to-end checks; the server must be running
+npm run lint    # ESLint (0 errors on the cleaned tree)
+```
 
-   interval: **every 5 minutes**. The endpoint answers `{ok:true}` for the right
-   token; anything else reads as a generic 404. The `k` value is never echoed or
-   logged. `/healthz` stays public and secret-free (Render's own health check
-   should keep using `/healthz`).
+`npm run smoke` signs up a throwaway shop against the real Supabase project, exercises
+the Rythu save path, and deletes every row it created.
 
-Cold starts surviving anyway: the browser shows a non-blocking
-"సర్వర్ మేల్కొంటోంది…" banner after 4 s, retries failing GETs once,
-and gives up after 30 s with a clear Telugu message.
+### Seed and clean demo data
 
-## Architecture (10 lines)
+```bash
+npm run seed        # create the two demo shops and their fake ledger
+npm run seed:clean  # delete the demo shops and all their rows
+```
 
-1. Express server (`server.js`) — CSP-safe static frontend + JSON API, signed httpOnly session cookies.
-2. `security.js` — request ids, strict CSP/headers, same-origin CSRF guard, opaque error handler, secret validation.
-3. `lib/money.js` — integer paise math; amounts are exact up to ₹99,99,999 with Indian grouping.
-4. `lib/ledger.js` — transactions in Supabase Postgres: server-computed amounts, idempotency keys, reversals, settlement allocation.
-5. `lib/ack.js` — hashed (never plaintext) acknowledgement tokens, expiry, revoke-on-reversal, dispute/resolve state machine.
-6. `public/app.js` — hash-routed SPA: splash → login (phone + spoken word + PIN) → profile → home/kirana/rythu tabs.
-7. `public/parser.js` + `rythu-parser.js` — rule-based Telugu/English parser; `resolver.js` — exact/label/alias/fuzzy name matching shared client+server.
-8. Mic flow: record → `/api/stt` → propose card → confirm (idempotent key) → save.
-9. TTS flow: `/api/tts` with a sentence cache in `data/tts-cache/` — voice is a convenience, never a gate.
-10. Migrations in `supabase/migrations/` (additive; no destructive changes).
+<a id="demo-logins"></a>
+**Demo logins** — all data is fake:
+
+| Product | Phone | PIN | Shop |
+|---|---|---|---|
+| Kirana | `9000000001` | `1234` | Demo Kirana |
+| Rythu | `9000000002` | `1234` | Demo Rythu |
+
+Login is phone → listen to the challenge and pick the spoken word → PIN. The spoken
+word is part of the demo login, not phone-ownership verification (see limitations).
+
+## Deployment on Render
+
+- **Build command:** `npm install`
+- **Start command:** `npm start`
+- **Environment:** `NODE_ENV=production`, `TRUST_PROXY=1`,
+  `APP_ORIGIN=https://<your-domain>`, plus the variables in the table above
+  (`GNANI_API_KEY`, `SUPABASE_URL`, `SUPABASE_SERVICE_KEY`, `JWT_SECRET`,
+  `KEEPALIVE_TOKEN`).
+- **Health check:** `GET /healthz` returns `{"ok":true}` and stays public and secret-free.
+- **Keep-alive:** create an external cron (for example cron-job.org) that calls
+  `GET https://<your-domain>/keepalive?k=<KEEPALIVE_TOKEN>` every 5 minutes. The correct
+  token answers `{"ok":true}`; anything else reads as a generic 404 and the token is
+  never echoed or logged.
+- **Free tier:** Render's free instance sleeps after idle. The first request can take
+  tens of seconds; the browser shows a non-blocking wake-up banner and retries failing
+  GETs once. The TTS cache lives in `data/tts-cache/` and regenerates if absent.
+
+## Project structure
+
+```text
+khata-vani/
+├── server.js                  Express app: auth, ledger API, STT/TTS proxies, ack pages
+├── security.js                Headers, CSP, CSRF guard, log scrubbing, secret checks
+├── lib/
+│   ├── ledger.js              Transaction posting, idempotency, reversals, settlements
+│   ├── accounting.js          Opening balances, discounts, payment modes, commission
+│   ├── money.js               Integer-paise math and Indian formatting
+│   ├── ack.js                 Hashed acknowledgement tokens and state machine
+│   └── business-type.js       Kirana / Rythu access rules
+├── public/
+│   ├── index.html             App shell (SPA)
+│   ├── app.js                 Hash-routed UI, mic flow, statements, dashboard
+│   ├── parser.js              Rule-based Telugu/English ledger parser
+│   ├── rythu-parser.js        Rule-based produce/settlement parser
+│   ├── resolver.js            Exact/label/alias/fuzzy name matching
+│   ├── api.js                 Fetch wrapper with session handling
+│   ├── ack.html / ack.js      Public acknowledgement page
+│   ├── styles.css / ack.css   Design system and ack page styles
+│   └── icon.svg, icon-192/512.png, manifest.webmanifest, favicon.ico
+├── supabase/migrations/       Numbered, additive SQL migrations
+├── scripts/
+│   ├── seed-demo.js           Demo shops and fake ledger (seed / seed:clean)
+│   ├── smoke-rythu.js         End-to-end Rythu smoke test with cleanup
+│   └── make-icons.js          One-shot PWA icon generator (needs `sharp` via npx)
+├── tests/                     Hermetic suites for rythu, ack, accounting, audio, type
+├── test-*.js                  Hermetic suites for parser, resolver, security, ledger
+├── docs/
+│   ├── SECURITY.md            Security hardening report
+│   └── assets/                README images (placeholders until replaced)
+├── PITCH.md                   One-page pitch (TODO stub)
+├── .env.example               Environment variable names and safe defaults
+├── .gitignore
+├── eslint.config.js
+├── package.json
+└── package-lock.json
+```
 
 ## Known limitations
 
-- **Demo-grade login**: phone + voice word-check + PIN proves device/audio interaction, not phone ownership. Production roadmap: SMS OTP or passkeys.
-- **Acknowledgements are link-based, not legal proof**: anyone holding the secret link can answer; links are hashed, expiring, and revocable, but possession is the only credential.
-- **Free-tier cold starts**: on Render's free tier the first request after idle can take tens of seconds; TTS/STT also add latency.
-- **Rule-based parser**: no LLM fallback — unusual phrasings fall back to manual entry with a friendly explanation.
+- **Demo-grade login:** phone + spoken-word check + PIN proves device/audio interaction,
+  not phone ownership. Production roadmap: SMS OTP and passkeys.
+- **Acknowledgement is not legal proof:** anyone holding the secret link can answer.
+  Links are hashed, expiring and revocable, but possession is the only credential.
+- **Rule-based parser:** there is no LLM fallback; unusual phrasings fall back to manual
+  entry with a friendly explanation.
+- **Free-tier cold starts:** the first request after idle can take tens of seconds, and
+  STT/TTS add their own latency.
 
-## Tests
+## Roadmap
 
-```bash
-npm test          # 190+ hermetic checks (no network, no credits spent)
-npm run smoke     # 40 end-to-end checks against the real Supabase
-```
+- Dairy workflow (milk entries, rate charts, route-level settlements).
+- Offline-first entry capture with a sync queue.
+- More Indian languages beyond Telugu and English.
+- Production identity: SMS OTP and passkeys.
+
+## Acknowledgements
+
+Built for the **Great Indian AI Internship Challenge** with **Gnani AI** — Prisma for
+speech-to-text and Timbre for text-to-speech. Gnani AI and challenge logos belong to
+their respective owners and are used here only for attribution.
+
+**Author:** Chethan Regala, B.Tech, Godavari Global University ·
+[LinkedIn](AUTHOR_LINKEDIN_URL) · [X](AUTHOR_X_URL)
+
+License: to be added
