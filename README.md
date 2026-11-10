@@ -336,6 +336,4 @@ speech-to-text and Timbre for text-to-speech. Gnani AI and challenge logos belon
 their respective owners and are used here only for attribution.
 
 **Author:** Chethan Regala, B.Tech, Godavari Global University ·
-[LinkedIn](AUTHOR_LINKEDIN_URL) · [X](AUTHOR_X_URL)
-
-License: to be added
+[LinkedIn](https://www.linkedin.com/in/chethan-regala-9b671a34a/).
