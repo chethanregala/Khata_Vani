@@ -1,5 +1,12 @@
 .env
+.env.*
+!.env.example
 node_modules/
 data/
-data/tts-cache/
 *.log
+.DS_Store
+Thumbs.db
+coverage/
+*.zip
+*.bak
+*.tmp

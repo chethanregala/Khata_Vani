@@ -170,7 +170,7 @@ function clearSession(res) {
 // IMPORTANT: this authenticates completion of the audio interaction (a human
 // heard the word and picked it) — it does NOT prove ownership of the phone
 // number. Proper phone verification (OTP) is a documented future requirement
-// (see SECURITY-HARDENING.md).
+// (see docs/SECURITY.md).
 function voiceOkPhone(token, phone) {
   try {
     const p = jwt.verify(String(token), JWT_SECRET);
@@ -360,7 +360,7 @@ const WORDS = [
 // to the browser (the 3 option texts include the right word — only the audio
 // reveals which one). Completing it proves the audio interaction happened — it
 // is NOT proof of phone-number ownership (no OTP/provider is configured; see
-// SECURITY-HARDENING.md)
+// docs/SECURITY.md)
 const challenges = new Map(); // id -> { phone, word, expiresAt, used }
 const CHALLENGE_TTL = 2 * 60 * 1000;
 setInterval(() => {
@@ -380,7 +380,7 @@ function pickOptions(word) {
 // The spoken-word challenge verifies that the login session completed the
 // audio interaction; it does NOT verify ownership of the phone number.
 // Phone-ownership verification (OTP) is a future requirement — see
-// SECURITY-HARDENING.md. Do not describe this flow as phone verification.
+// docs/SECURITY.md. Do not describe this flow as phone verification.
 app.post('/api/auth/start', startLimiter, async (req, res) => {
   const phone = String((req.body && req.body.phone) || '').trim();
   if (!validPhone(phone)) return res.status(400).json({ error: '10 అంకెల సరైన మొబైల్ నంబర్ నమోదు చేయండి' });
